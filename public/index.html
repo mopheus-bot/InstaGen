@@ -12,16 +12,15 @@
     />
     <meta name="theme-color" content="#0a0a0a" />
     <meta name="color-scheme" content="dark" />
-    <meta name="description" content="Daily historical Instagram carousel generator." />
+    <meta name="description" content="InstaGen Theme Hub — pick a faceless channel engine to generate today's content." />
 
-    <!-- PWA / iOS standalone meta tags -->
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="InstaGen" />
     <meta name="format-detection" content="telephone=no" />
 
-    <title>InstaGen — Daily History Carousel</title>
+    <title>InstaGen — Theme Hub</title>
 
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%230a0a0a'/%3E%3Ctext x='50' y='66' font-family='-apple-system,sans-serif' font-size='52' font-weight='700' fill='white' text-anchor='middle'%3EI%3C/text%3E%3C/svg%3E" />
 
@@ -38,7 +37,6 @@
         --text-dim: #a0a0a0;
         --text-faint: #6a6a6a;
         --accent: #ffffff;
-        --danger: #ff5a5a;
         --radius: 16px;
         --radius-sm: 10px;
         --shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
@@ -82,345 +80,235 @@
       /* Layout                                                              */
       /* ----------------------------------------------------------------- */
       .app {
-        max-width: 720px;
+        max-width: 1200px;
         margin: 0 auto;
-        padding: 24px 20px 60px;
+        padding: 32px 20px 60px;
       }
 
-      .app-header {
+      /* ----------------------------------------------------------------- */
+      /* Header                                                              */
+      /* ----------------------------------------------------------------- */
+      .hub-header {
         text-align: center;
-        padding: 16px 0 28px;
+        padding: 8px 0 36px;
       }
 
-      .app-title {
-        font-family: var(--font-serif);
-        font-size: clamp(28px, 7vw, 40px);
-        font-weight: 600;
-        letter-spacing: -0.02em;
-        margin: 0 0 6px;
-      }
-
-      .app-subtitle {
-        margin: 0;
-        color: var(--text-dim);
-        font-size: 14px;
-        letter-spacing: 0.02em;
-      }
-
-      .app-subtitle strong {
-        color: var(--text);
-        font-weight: 500;
-      }
-
-      /* ----------------------------------------------------------------- */
-      /* Primary action button                                              */
-      /* ----------------------------------------------------------------- */
-      .generate-btn {
-        width: 100%;
-        padding: 22px 24px;
-        background: var(--accent);
-        color: #000;
-        border: none;
-        border-radius: var(--radius);
-        font-family: inherit;
-        font-size: 17px;
-        font-weight: 600;
-        letter-spacing: -0.01em;
-        cursor: pointer;
-        transition: transform 120ms ease, opacity 200ms ease, background 200ms ease;
-        box-shadow: var(--shadow);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 10px;
-      }
-
-      .generate-btn:hover {
-        transform: translateY(-1px);
-      }
-
-      .generate-btn:active {
-        transform: translateY(0) scale(0.99);
-      }
-
-      .generate-btn:disabled {
-        opacity: 0.6;
-        cursor: not-allowed;
-        transform: none;
-      }
-
-      .generate-btn__icon {
-        width: 20px;
-        height: 20px;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-      }
-
-      /* ----------------------------------------------------------------- */
-      /* Loading state                                                       */
-      /* ----------------------------------------------------------------- */
-      .loading {
-        margin-top: 28px;
-        padding: 36px 24px;
+      .hub-eyebrow {
+        display: inline-block;
+        margin: 0 0 14px;
+        padding: 6px 12px;
         background: var(--bg-elev);
         border: 1px solid var(--border);
-        border-radius: var(--radius);
-        text-align: center;
-      }
-
-      .spinner {
-        width: 44px;
-        height: 44px;
-        margin: 0 auto 18px;
-        border: 3px solid var(--border);
-        border-top-color: var(--accent);
-        border-radius: 50%;
-        animation: spin 0.9s linear infinite;
-      }
-
-      @keyframes spin {
-        to {
-          transform: rotate(360deg);
-        }
-      }
-
-      .loading-ticker {
-        font-size: 15px;
-        color: var(--text);
-        min-height: 22px;
-        font-weight: 500;
-        transition: opacity 250ms ease;
-      }
-
-      .loading-progress {
-        margin-top: 8px;
-        font-size: 12px;
-        color: var(--text-faint);
-        letter-spacing: 0.04em;
-        text-transform: uppercase;
-      }
-
-      .progress-bar {
-        margin-top: 18px;
-        height: 3px;
-        background: var(--bg-card);
-        border-radius: 3px;
-        overflow: hidden;
-      }
-
-      .progress-bar__fill {
-        height: 100%;
-        width: 0%;
-        background: var(--accent);
-        border-radius: 3px;
-        transition: width 600ms ease;
-      }
-
-      /* ----------------------------------------------------------------- */
-      /* Error banner                                                        */
-      /* ----------------------------------------------------------------- */
-      .error-banner {
-        margin-top: 20px;
-        padding: 14px 16px;
-        background: rgba(255, 90, 90, 0.1);
-        border: 1px solid rgba(255, 90, 90, 0.3);
-        border-radius: var(--radius-sm);
-        color: var(--danger);
-        font-size: 14px;
-        line-height: 1.4;
-      }
-
-      /* ----------------------------------------------------------------- */
-      /* Results grid                                                        */
-      /* ----------------------------------------------------------------- */
-      .results {
-        margin-top: 36px;
-      }
-
-      .results-header {
-        display: flex;
-        align-items: baseline;
-        justify-content: space-between;
-        margin-bottom: 18px;
-        padding: 0 4px;
-      }
-
-      .results-title {
-        font-family: var(--font-serif);
-        font-size: 22px;
+        border-radius: 999px;
+        font-size: 11px;
         font-weight: 600;
-        margin: 0;
-        letter-spacing: -0.01em;
-      }
-
-      .results-meta {
-        font-size: 12px;
-        color: var(--text-faint);
+        letter-spacing: 0.14em;
         text-transform: uppercase;
-        letter-spacing: 0.06em;
+        color: var(--text-dim);
       }
 
-      .slide-grid {
+      .hub-title {
+        font-family: var(--font-serif);
+        font-size: clamp(32px, 6.5vw, 48px);
+        font-weight: 600;
+        letter-spacing: -0.02em;
+        margin: 0 0 10px;
+        line-height: 1.05;
+      }
+
+      .hub-subtitle {
+        margin: 0 auto;
+        max-width: 560px;
+        color: var(--text-dim);
+        font-size: 15px;
+        line-height: 1.5;
+        letter-spacing: 0.01em;
+      }
+
+      .hub-subtitle strong {
+        color: var(--text);
+        font-weight: 500;
+      }
+
+      /* ----------------------------------------------------------------- */
+      /* Niche grid                                                          */
+      /* ----------------------------------------------------------------- */
+      .niche-grid {
+        margin-top: 28px;
         display: grid;
         grid-template-columns: 1fr;
-        gap: 18px;
+        gap: 16px;
       }
 
       @media (min-width: 640px) {
-        .slide-grid {
+        .niche-grid {
           grid-template-columns: repeat(2, 1fr);
+          gap: 18px;
+        }
+      }
+
+      @media (min-width: 960px) {
+        .niche-grid {
+          grid-template-columns: repeat(3, 1fr);
+          gap: 20px;
+        }
+      }
+
+      @media (min-width: 1200px) {
+        .niche-grid {
+          grid-template-columns: repeat(4, 1fr);
         }
       }
 
       /* ----------------------------------------------------------------- */
-      /* Slide card                                                          */
+      /* Niche card                                                          */
       /* ----------------------------------------------------------------- */
-      .slide {
+      .niche-card {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        justify-content: flex-end;
+        min-height: 200px;
+        padding: 22px 22px 20px;
         background: var(--bg-card);
         border: 1px solid var(--border);
         border-radius: var(--radius);
         overflow: hidden;
-        display: flex;
-        flex-direction: column;
-        transition: transform 200ms ease;
-      }
-
-      .slide:active {
-        transform: scale(0.99);
-      }
-
-      .slide-image-wrap {
-        position: relative;
-        aspect-ratio: 9 / 16;
-        background: var(--bg-elev);
-        overflow: hidden;
-      }
-
-      .slide-image {
-        width: 100%;
-        height: 100%;
-        object-fit: cover;
-        display: block;
-        opacity: 0;
-        transition: opacity 400ms ease;
-      }
-
-      .slide-image.loaded {
-        opacity: 1;
-      }
-
-      .slide-year {
-        position: absolute;
-        top: 12px;
-        left: 12px;
-        padding: 6px 10px;
-        background: rgba(0, 0, 0, 0.7);
-        backdrop-filter: blur(10px);
-        -webkit-backdrop-filter: blur(10px);
-        border-radius: 999px;
-        font-size: 12px;
-        font-weight: 600;
-        letter-spacing: 0.04em;
-      }
-
-      .slide-body {
-        padding: 16px 18px 18px;
-        display: flex;
-        flex-direction: column;
-        flex: 1;
-      }
-
-      .slide-title {
-        font-family: var(--font-serif);
-        font-size: 18px;
-        font-weight: 600;
-        line-height: 1.25;
-        margin: 0 0 8px;
-        letter-spacing: -0.01em;
-      }
-
-      .slide-description {
-        font-size: 14px;
-        line-height: 1.5;
-        color: var(--text-dim);
-        margin: 0 0 16px;
-        flex: 1;
-      }
-
-      .slide-actions {
-        display: flex;
-        gap: 8px;
-      }
-
-      .download-btn {
-        flex: 1;
-        padding: 11px 14px;
-        background: transparent;
-        color: var(--text);
-        border: 1px solid var(--border);
-        border-radius: var(--radius-sm);
-        font-family: inherit;
-        font-size: 13px;
-        font-weight: 500;
         cursor: pointer;
-        transition: background 200ms ease, border-color 200ms ease;
+        text-align: left;
+        font-family: inherit;
+        color: inherit;
+        /* Layered transitions: hover lift, click pulse, route-leave scale. */
+        transition: transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1),
+                    border-color 220ms ease,
+                    box-shadow 220ms ease;
+        will-change: transform, opacity;
+      }
+
+      .niche-card::before {
+        /* Per-niche gradient overlay (set as a custom property in JS/HTML). */
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: var(--niche-gradient, linear-gradient(135deg, #2a2a2a, #1a1a1a));
+        opacity: 0.85;
+        z-index: 0;
+        transition: opacity 220ms ease, transform 320ms ease;
+      }
+
+      .niche-card::after {
+        /* Subtle grain texture so the gradient doesn't look like flat CSS. */
+        content: "";
+        position: absolute;
+        inset: 0;
+        background-image:
+          radial-gradient(circle at 20% 10%, rgba(255, 255, 255, 0.08), transparent 50%),
+          radial-gradient(circle at 80% 90%, rgba(0, 0, 0, 0.4), transparent 60%);
+        z-index: 1;
+        pointer-events: none;
+      }
+
+      .niche-card:hover {
+        transform: translateY(-3px);
+        border-color: rgba(255, 255, 255, 0.18);
+        box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+      }
+
+      .niche-card:hover::before {
+        opacity: 1;
+        transform: scale(1.04);
+      }
+
+      .niche-card:active {
+        transform: translateY(-1px) scale(0.99);
+      }
+
+      /* Leaving-state animation triggered by JS before navigation. */
+      .niche-card.is-leaving {
+        animation: niche-leave 360ms cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+        pointer-events: none;
+      }
+
+      @keyframes niche-leave {
+        0%   { transform: scale(1);   opacity: 1; }
+        40%  { transform: scale(1.04); opacity: 1; }
+        100% { transform: scale(0.96); opacity: 0; }
+      }
+
+      .niche-card__inner {
+        position: relative;
+        z-index: 2;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .niche-card__icon {
+        width: 38px;
+        height: 38px;
         display: inline-flex;
         align-items: center;
         justify-content: center;
+        background: rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 12px;
+        backdrop-filter: blur(8px);
+        -webkit-backdrop-filter: blur(8px);
+        color: #fff;
+        margin-bottom: 6px;
+      }
+
+      .niche-card__icon svg {
+        width: 20px;
+        height: 20px;
+      }
+
+      .niche-card__title {
+        font-family: var(--font-serif);
+        font-size: 20px;
+        font-weight: 600;
+        line-height: 1.2;
+        letter-spacing: -0.01em;
+        margin: 0;
+        color: #fff;
+        text-shadow: 0 2px 12px rgba(0, 0, 0, 0.5);
+      }
+
+      .niche-card__tag {
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: rgba(255, 255, 255, 0.75);
+      }
+
+      .niche-card__cta {
+        margin-top: 12px;
+        display: inline-flex;
+        align-items: center;
         gap: 6px;
+        font-size: 13px;
+        font-weight: 500;
+        color: rgba(255, 255, 255, 0.9);
+        opacity: 0;
+        transform: translateX(-4px);
+        transition: opacity 220ms ease, transform 220ms ease;
       }
 
-      .download-btn:hover {
-        background: rgba(255, 255, 255, 0.05);
-        border-color: rgba(255, 255, 255, 0.2);
+      .niche-card:hover .niche-card__cta {
+        opacity: 1;
+        transform: translateX(0);
       }
 
-      .download-btn:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
-
-      .download-btn__icon {
+      .niche-card__cta svg {
         width: 14px;
         height: 14px;
-      }
-
-      /* Subtle, text-link style button used for "Copy description" etc.
-         Stays low-emphasis — the description is the primary content,
-         the button is just a one-tap shortcut for grabbing the text. */
-      .copy-text-btn {
-        align-self: flex-start;
-        margin: -6px 0 14px;
-        padding: 4px 0;
-        background: transparent;
-        border: none;
-        color: var(--text-faint);
-        font-family: inherit;
-        font-size: 11px;
-        font-weight: 500;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-        cursor: pointer;
-        transition: color 200ms ease;
-      }
-
-      .copy-text-btn:hover {
-        color: var(--text);
-      }
-
-      .copy-text-btn:active {
-        transform: scale(0.97);
-      }
-
-      .copy-text-btn.copied {
-        color: #6ee7a3;
       }
 
       /* ----------------------------------------------------------------- */
       /* Footer                                                              */
       /* ----------------------------------------------------------------- */
-      .app-footer {
+      .hub-footer {
         margin-top: 40px;
         text-align: center;
         font-size: 12px;
@@ -428,9 +316,6 @@
         letter-spacing: 0.04em;
       }
 
-      /* ----------------------------------------------------------------- */
-      /* Utility                                                             */
-      /* ----------------------------------------------------------------- */
       [hidden] {
         display: none !important;
       }
@@ -438,56 +323,28 @@
   </head>
   <body>
     <main class="app">
-      <header class="app-header">
-        <h1 class="app-title">InstaGen</h1>
-        <p class="app-subtitle">
-          Eight moments in history for
-          <strong id="today-date">today</strong>
+      <header class="hub-header">
+        <span class="hub-eyebrow">Theme Hub</span>
+        <h1 class="hub-title">Choose your channel</h1>
+        <p class="hub-subtitle">
+          Seven faceless engines. Each one generates a daily
+          <strong>8-slide carousel</strong> tuned to its niche, ready for Instagram.
         </p>
       </header>
 
-      <button id="generate-btn" class="generate-btn" type="button">
-        <span class="generate-btn__icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none" width="20" height="20">
-            <path
-              d="M12 2v3M12 19v3M4.93 4.93l2.12 2.12M16.95 16.95l2.12 2.12M2 12h3M19 12h3M4.93 19.07l2.12-2.12M16.95 7.05l2.12-2.12"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-            />
-            <circle cx="12" cy="12" r="4" fill="currentColor" />
-          </svg>
-        </span>
-        <span id="generate-btn__label">Generate Today's Content</span>
-      </button>
-
-      <!-- Loading state — shown while a generation is in flight -->
-      <section id="loading" class="loading" hidden>
-        <div class="spinner" aria-label="Loading"></div>
-        <div id="ticker" class="loading-ticker">Researching history...</div>
-        <div class="loading-progress">This usually takes 60–90 seconds</div>
-        <div class="progress-bar" aria-hidden="true">
-          <div id="progress-fill" class="progress-bar__fill"></div>
-        </div>
+      <!-- Niche grid: 7 engines. The order and labels are the product surface;
+           keep them stable — /generator reads the active niche from the same
+           id and passes it to /api/generate-content. -->
+      <section class="niche-grid" id="niche-grid" aria-label="Available niches">
+        <!-- Cards are rendered by hub.js so we can keep the niche registry
+             (id, label, gradient, icon) in one place. -->
       </section>
 
-      <!-- Error banner — only rendered if /api/generate-content fails -->
-      <div id="error" class="error-banner" hidden></div>
-
-      <!-- Results grid — populated after a successful generation -->
-      <section id="results" class="results" hidden>
-        <div class="results-header">
-          <h2 class="results-title">Your Carousel</h2>
-          <span id="results-meta" class="results-meta"></span>
-        </div>
-        <div id="slide-grid" class="slide-grid"></div>
-      </section>
-
-      <footer class="app-footer">
-        Generated locally · Cached for today
+      <footer class="hub-footer">
+        InstaGen · Pick a niche to start today's run
       </footer>
     </main>
 
-    <script src="/app.js" type="module"></script>
+    <script type="module" src="/hub.js"></script>
   </body>
 </html>

@@ -6,6 +6,10 @@
 //   Step 1 — Text synthesis (MiniMax-M3)        → 8 historical events
 //   Step 2 — Image parallelization (image-01)   → 8 visuals via Promise.all
 //
+// Persona + visual aesthetic per niche are resolved at request time by
+// the Prompt Factory in api/niche_profiles.js. This file no longer
+// carries its own NICHES map — the factory is the single source of truth.
+//
 // Required env:
 //   MINIMAX_API_KEY
 //
@@ -20,21 +24,38 @@
 // =====================================================================
 
 // ---------------------------------------------------------------------
+// Imports
+// ---------------------------------------------------------------------
+import { resolveNicheProfile } from './niche_profiles.js';
+import { buildNicheQuery } from './niche_queries.js';
+
+// ---------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------
 const TEXT_API_URL = 'https://api.minimax.io/anthropic/v1/messages';
 const IMAGE_API_URL = 'https://api.minimax.io/v1/image_generation';
 const PLACEHOLDER_IMAGE = '/assets/placeholder-error.png';
 
-// Global aesthetic signature appended to every image prompt so the
-// carousel has a consistent cinematic look across all 8 slides.
-const AESTHETIC_SUFFIX =
+// Default aesthetic signature — used only as a defensive fallback if a
+// profile is somehow missing its imageStyleSuffix. The per-niche
+// signature is what actually drives the image model.
+const DEFAULT_AESTHETIC_SUFFIX =
   ', historical cinematic film still, documentary textures, ' +
   'highly photorealistic, square crop';
 
 // Target slide count — the system prompt also enforces this, but we
 // cap defensively after parsing in case the model returns extras.
 const TARGET_SLIDE_COUNT = 8;
+
+// ---------------------------------------------------------------------
+// Niche persona + image aesthetic
+// ---------------------------------------------------------------------
+// Resolved per-request via the Prompt Factory in api/niche_profiles.js.
+// Each profile supplies the complete text system prompt, the per-niche
+// image style suffix, the display label, and the sampling temperature.
+// An unknown / missing / malformed niche id always falls back to the
+// 'history' profile, so the original engine's behavior is preserved.
+// ---------------------------------------------------------------------
 
 // ---------------------------------------------------------------------
 // Date helpers (run on the server, use server-local timezone)
@@ -58,40 +79,24 @@ function getPrettyDate() {
 }
 
 // ---------------------------------------------------------------------
-// Step 1 — Text synthesis (historical-archivist agent)
+// Step 1 — Text synthesis (niche-aware agent)
 // ---------------------------------------------------------------------
 
 /**
- * The exact, un-wrapped system-prompt rulebook that defines the agent
- * persona and pins down the JSON-array data contract. Verbatim per the
- * project spec — do not edit lightly, the model is sensitive to drift.
- */
-const HISTORICAL_AGENT_SYSTEM_PROMPT = [
-  'You are a highly specialized historical research archivist and expert social media copywriter for an educational Instagram brand.',
-  '',
-  'Your sole task is to take a provided date and return a list of exactly 8 highly compelling, historically significant events that occurred on that calendar day throughout history.',
-  '',
-  'CRITICAL CONSTRAINT: You must output ONLY a raw, valid JSON array matching the designated data contract. Do NOT wrap the output in markdown code blocks (such as ```json ... ```), do NOT include an introductory sentence, and do NOT append conversational prose.',
-  '',
-  'The JSON array must contain exactly 8 objects matching this structural interface:',
-  '[',
-  '  {',
-  '    "year": "string (e.g., \'1969\' or \'44 BC\')",',
-  '    "title": "string (click-optimized headline, maximum 8 words)",',
-  '    "description": "string (retentive, high-engagement 2-3 sentence narrative hook summarizing the event)",',
-  '    "image_prompt": "string (a descriptive, highly specific text-to-image prompt detailing the visual scene of the historical event for a generation engine)"',
-  '  }',
-  ']',
-].join('\n');
-
-/**
- * The historical-archivist text-generation agent.
+ * The niche-aware text-generation agent.
  *
  * Issues a single POST to the MiniMax Anthropic-compatible endpoint
  * (https://api.minimax.io/anthropic/v1/messages), pinned to the
- * MiniMax-M3 model, with the strict archivist system prompt delivered
+ * MiniMax-M3 model, with the persona's FULL system prompt delivered
  * via the top-level `system` field (per the Anthropic Messages API
  * contract — NOT as a {role:"system"} entry in the messages array).
+ *
+ * The system prompt comes from the resolved niche profile (see
+ * api/niche_profiles.js). Each profile pins its own persona rules
+ * AND the strict JSON-array data contract, so the model cannot
+ * drift into a different output shape just because the persona
+ * changes. The factory also supplies the sampling temperature per
+ * profile (default 0.6).
  *
  * Response shape (Anthropic Messages):
  *   { content: [
@@ -103,6 +108,11 @@ const HISTORICAL_AGENT_SYSTEM_PROMPT = [
  * We extract the first `text` block (skipping any `thinking` blocks).
  *
  * @param {string}        currentDate  Human-readable date (e.g., "January 7").
+ * @param {string}        nicheId      Active niche id from the request
+ *                                     body. Resolved by the Prompt
+ *                                     Factory to a full profile object
+ *                                     (text system prompt, label,
+ *                                     temperature, image suffix).
  * @param {AbortSignal}   [signal]     Optional AbortSignal — typically
  *                                     `request.signal` from the Vercel
  *                                     Web Handler. When the client
@@ -114,8 +124,32 @@ const HISTORICAL_AGENT_SYSTEM_PROMPT = [
  * @throws  If the request fails, the response is non-2xx, or the
  *          body is empty.
  */
-async function runHistoricalTextAgent(currentDate, signal) {
+async function runHistoricalTextAgent(currentDate, nicheId, signal) {
   const apiKey = process.env.MINIMAX_API_KEY;
+  const profile = resolveNicheProfile(nicheId);
+
+  // The profile carries the COMPLETE system prompt — persona, topic
+  // rules, and the JSON-array data contract are all defined there.
+  // No further assembly is needed here.
+  const systemPrompt = profile.textSystemPrompt;
+  const temperature = typeof profile.textTemperature === 'number'
+    ? profile.textTemperature
+    : 0.6;
+
+  // Resolve the niche-specific query context (search terms, category
+  // filters, date window, and the explicit query directive) from the
+  // Data Access Layer in api/niche_queries.js. This is the
+  // "conditional query builder" the spec calls for: it tells the
+  // archivist LLM EXACTLY which slice of history to query for this
+  // niche on this date (e.g. "court case, heist, mystery, unsolved,
+  // arrest" for true_crime) BEFORE the AI filter agent ever sees the
+  // results. The directive is the first line of the user message so
+  // the model reads the search brief before anything else.
+  const queryContext = buildNicheQuery(nicheId, currentDate);
+  console.log(
+    `[niche-query] active=${queryContext.id} window="${queryContext.dateWindow}" ` +
+    `terms=${queryContext.searchTerms.length} categories=${queryContext.categoryFilters.length}`
+  );
 
   const response = await fetch(TEXT_API_URL, {
     method: 'POST',
@@ -131,13 +165,23 @@ async function runHistoricalTextAgent(currentDate, signal) {
     body: JSON.stringify({
       model: 'MiniMax-M3',
       // System prompt lives at the top level in the Anthropic format.
-      system: HISTORICAL_AGENT_SYSTEM_PROMPT,
+      system: systemPrompt,
       messages: [
-        { role: 'user', content: `Today is ${currentDate}. Return the 8 historical events for this date as a raw JSON array.` },
+        // Query directive FIRST (the search brief for this niche on
+        // this date), then the human-readable date + format reminder.
+        // The profile's system prompt already pins the JSON contract
+        // and persona; the directive is a focused, niche-specific
+        // search instruction that scopes WHICH data to fetch.
+        {
+          role: 'user',
+          content:
+            `${queryContext.directive}\n\n` +
+            `Today is ${currentDate}. Return the 8 events for this date ` +
+            `in the "${profile.label}" niche as a raw JSON array.`,
+        },
       ],
-      // 0.6 balances factual historical accuracy with engaging,
-      // click-optimized copywriting for the Instagram brand voice.
-      temperature: 0.6,
+      // Per-niche temperature from the profile (default 0.6).
+      temperature,
       max_tokens: 4096,
     }),
     // Forward the AbortSignal so a client disconnect cancels the
@@ -246,12 +290,21 @@ function normalizeEvent(raw, index) {
  *
  * @param {string}      apiKey
  * @param {string}      imagePrompt
- * @param {AbortSignal} [signal]  Forwarded AbortSignal — when the
- *                                client disconnects, the in-flight
- *                                image request is cancelled.
+ * @param {string}      [styleSuffix]  Per-niche visual signature
+ *                                     resolved from the active
+ *                                     profile. Falls back to
+ *                                     DEFAULT_AESTHETIC_SUFFIX if
+ *                                     missing/empty.
+ * @param {AbortSignal} [signal]       Forwarded AbortSignal — when
+ *                                     the client disconnects, the
+ *                                     in-flight image request is
+ *                                     cancelled.
  */
-async function callImageAPI(apiKey, imagePrompt, signal) {
-  const fullPrompt = `${imagePrompt}${AESTHETIC_SUFFIX}`;
+async function callImageAPI(apiKey, imagePrompt, styleSuffix, signal) {
+  const suffix = (typeof styleSuffix === 'string' && styleSuffix.length > 0)
+    ? styleSuffix
+    : DEFAULT_AESTHETIC_SUFFIX;
+  const fullPrompt = `${imagePrompt}${suffix}`;
 
   const response = await fetch(IMAGE_API_URL, {
     method: 'POST',
@@ -313,16 +366,20 @@ async function callImageAPI(apiKey, imagePrompt, signal) {
  * @param {string}      apiKey
  * @param {string}      imagePrompt
  * @param {number}      slideIndex
- * @param {AbortSignal} [signal]  Forwarded to callImageAPI. If the
- *                                client disconnects mid-flight, the
- *                                AbortError is rethrown so the entire
- *                                pipeline terminates (no point
- *                                continuing to spend API credits on a
- *                                response that has no listener).
+ * @param {string}      [styleSuffix]  Per-niche visual signature
+ *                                     forwarded to callImageAPI.
+ * @param {AbortSignal} [signal]       Forwarded to callImageAPI. If
+ *                                     the client disconnects
+ *                                     mid-flight, the AbortError is
+ *                                     rethrown so the entire
+ *                                     pipeline terminates (no point
+ *                                     continuing to spend API credits
+ *                                     on a response that has no
+ *                                     listener).
  */
-async function generateImageSafely(apiKey, imagePrompt, slideIndex, signal) {
+async function generateImageSafely(apiKey, imagePrompt, slideIndex, styleSuffix, signal) {
   try {
-    const url = await callImageAPI(apiKey, imagePrompt, signal);
+    const url = await callImageAPI(apiKey, imagePrompt, styleSuffix, signal);
     if (!url) {
       console.error(`[image] slice ${slideIndex}: no URL in response, using placeholder`);
       return PLACEHOLDER_IMAGE;
@@ -404,16 +461,34 @@ export async function POST(request) {
   const dateKey = getDateKey();
   const prettyDate = getPrettyDate();
 
+  // --- Niche context (from POST body) -------------------------------
+  // The frontend posts { niche: 'true-crime' | 'history' | ... }.
+  // We tolerate a missing/unknown body by letting the factory fall
+  // back to the 'history' profile, so an empty payload keeps the
+  // original engine's behavior. Both kebab-case (legacy) and
+  // snake_case (current) ids are accepted — see resolveNicheProfile.
+  let requestedNiche;
+  try {
+    const body = await request.json();
+    if (body && typeof body.niche === 'string') {
+      requestedNiche = body.niche;
+    }
+  } catch {
+    // No body / non-JSON body — fine, the factory will fall back.
+  }
+  const profile = resolveNicheProfile(requestedNiche);
+  console.log(`[niche] active=${profile.id}`);
+
   try {
     // -----------------------------------------------------------------
-    // STEP 1 — Text synthesis via MiniMax-M3 (historical-archivist agent)
+    // STEP 1 — Text synthesis via MiniMax-M3 (niche-aware agent)
     // -----------------------------------------------------------------
-    console.log(`[text] requesting events for ${prettyDate} (${dateKey}) ...`);
+    console.log(`[text] requesting events for ${prettyDate} (${dateKey}) · niche=${profile.id} ...`);
 
-    // Hand the dynamically-resolved current date to the agent. The
-    // agent itself is responsible for assembling the request body,
-    // pinning the model, and authenticating.
-    const rawLlmText = await runHistoricalTextAgent(prettyDate, request.signal);
+    // Hand the dynamically-resolved current date AND the requested
+    // niche id to the agent. The agent resolves the id to a full
+    // profile (system prompt, temperature) via the factory.
+    const rawLlmText = await runHistoricalTextAgent(prettyDate, profile.id, request.signal);
 
     if (!rawLlmText) {
       throw new Error('Text API returned empty content.');
@@ -461,11 +536,12 @@ export async function POST(request) {
     // internally and falls back to the placeholder, so a single
     // failure cannot reject the whole Promise.all() and take down
     // the entire carousel. AbortError (client disconnect) is
-    // rethrown so the pipeline terminates cleanly.
+    // rethrown so the pipeline terminates cleanly. The per-niche
+    // image style suffix drives the visual identity of every slice.
     console.log(`[image] dispatching ${targetEvents.length} parallel requests ...`);
     const imageUrls = await Promise.all(
       targetEvents.map((event, idx) =>
-        generateImageSafely(apiKey, event.image_prompt, idx, request.signal)
+        generateImageSafely(apiKey, event.image_prompt, idx, profile.imageStyleSuffix, request.signal)
       )
     );
 
@@ -476,20 +552,23 @@ export async function POST(request) {
     // STEP 3 — Assemble the response payload (matches the frontend
     // data contract in public/app.js).
     // -----------------------------------------------------------------
+    const imageStyleSuffix = profile.imageStyleSuffix || DEFAULT_AESTHETIC_SUFFIX;
     const slides = targetEvents.map((event, idx) => ({
       year: event.year,
       title: event.title,
       description: event.description,
       // Surface the full image prompt so the UI can show + let the user
       // copy it. The prompt is the verbatim text we sent to the image
-      // model (including the AESTHETIC_SUFFIX it was suffixed with).
-      imagePrompt: `${event.image_prompt}${AESTHETIC_SUFFIX}`,
+      // model (including the per-niche imageStyleSuffix).
+      imagePrompt: `${event.image_prompt}${imageStyleSuffix}`,
       imageUrl: imageUrls[idx],
     }));
 
     return jsonResponse({
       dateKey,                                // YYYY-MM-DD (cache key)
       generatedAt: new Date().toISOString(),  // ISO timestamp
+      niche: profile.id,                      // echoed back for client display
+      nicheLabel: profile.label,              // human-readable label
       slides,
     });
   } catch (err) {

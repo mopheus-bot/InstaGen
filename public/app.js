@@ -2,19 +2,34 @@
 // InstaGen — Frontend controller (vanilla ES module)
 // =====================================================================
 // Responsibilities:
-//   1. Render the "today" date in the header
-//   2. Check localStorage for a cached carousel for today's calendar day
+//   1. Read the active niche from the global store (set on / by hub.js)
+//      and render the niche badge at the top of the page
+//   2. Render the "today" date in the header
+//   3. Check localStorage for a cached carousel for (today, active niche)
 //      and short-circuit the backend call when one exists (saves API credits)
-//   3. POST /api/generate-content on demand
-//   4. Drive the loading UI: spinner, ticker micro-copy rotation, fake
+//   4. POST /api/generate-content with { niche } on demand
+//   5. Drive the loading UI: spinner, ticker micro-copy rotation, fake
 //      progress bar (so the 60-90s wait feels alive)
-//   5. Render the slide grid (year badge, image, title, description,
+//   6. Render the slide grid (year badge, image, title, description,
 //      per-slide download button)
-//   6. Handle errors gracefully and surface them in the error banner
+//   7. Handle errors gracefully and surface them in the error banner
 // =====================================================================
 
+import {
+  getActiveNiche,
+  subscribeActiveNiche,
+  getNiche,
+} from './state.js';
+
 const API_ENDPOINT = '/api/generate-content';
-const CACHE_KEY = 'instagen:daily:v1';
+const VIDEO_API_ENDPOINT = '/api/generate-daily-videos';
+
+// Cache is keyed by (niche, date) so picking a different niche on the
+// hub doesn't show another niche's cached carousel. The legacy single-key
+// 'instagen:daily:v1' is still read on first load for back-compat with
+// payloads generated before niches existed — those are treated as the
+// 'history' niche and re-cached under the new key on the next save.
+const CACHE_KEY_PREFIX = 'instagen:daily:v2:';
 
 // Micro-copy shown while the backend works. Rotates every ~4s to keep
 // the user engaged during the long generation window.
@@ -28,10 +43,24 @@ const TICKER_MESSAGES = [
   'Finalizing carousel...',
 ];
 
+// Micro-copy shown while the video generation backend is working.
+// The first message is the one spelled out in the spec — it stays on
+// screen for the first interval, then the rest rotate every ~4s.
+const VIDEO_TICKER_MESSAGES = [
+  "Analyzing Day's Events & Generating Videos...",
+  'Storyboarding scenes...',
+  'Rendering footage...',
+  'Stitching clips together...',
+  'Adding motion blur...',
+  'Polishing the final cut...',
+];
+
 // ---------------------------------------------------------------------
 // Element references
 // ---------------------------------------------------------------------
 const els = {
+  nicheBadge: document.getElementById('niche-badge'),
+  nicheBadgeLabel: document.getElementById('niche-badge__label'),
   todayDate: document.getElementById('today-date'),
   generateBtn: document.getElementById('generate-btn'),
   generateBtnLabel: document.getElementById('generate-btn__label'),
@@ -42,7 +71,31 @@ const els = {
   results: document.getElementById('results'),
   resultsMeta: document.getElementById('results-meta'),
   slideGrid: document.getElementById('slide-grid'),
+  videos: document.getElementById('videos'),
+  generateVideosBtn: document.getElementById('generate-videos-btn'),
+  generateVideosBtnLabel: document.getElementById('generate-videos-btn__label'),
+  videosLoading: document.getElementById('videos-loading'),
+  videosTicker: document.getElementById('videos-ticker'),
+  videosProgressFill: document.getElementById('videos-progress-fill'),
+  videosError: document.getElementById('videos-error'),
+  videosMeta: document.getElementById('videos-meta'),
+  videoGrid: document.getElementById('video-grid'),
 };
+
+// ---------------------------------------------------------------------
+// Active niche — the live value is held in module scope and updated by
+// the store subscription below. The badge, cache key, and API payload
+// all read from this single variable so they stay in lockstep.
+// ---------------------------------------------------------------------
+let activeNiche = getActiveNiche();
+
+function getCacheKey() {
+  // Falls back to 'history' when no niche has been picked (e.g. someone
+  // deep-linked straight to /generator). getNiche() also returns the
+  // history record in that case, so the API call still gets a valid id.
+  const niche = getNiche(activeNiche).id;
+  return `${CACHE_KEY_PREFIX}${niche}:${getTodayKey()}`;
+}
 
 // ---------------------------------------------------------------------
 // Date utilities
@@ -70,13 +123,17 @@ function getPrettyToday() {
 // ---------------------------------------------------------------------
 
 /**
- * Returns the cached payload for today, or null. The cache is keyed by
- * the calendar day — entries from previous days are intentionally
- * ignored so the user always sees fresh content once a new day starts.
+ * Returns the cached payload for the active niche + today, or null.
+ * The cache is keyed by (niche, calendar day) — entries from previous
+ * days are intentionally ignored so the user always sees fresh content
+ * once a new day starts, and entries for a different niche are not
+ * returned (so switching from True Crime to History on the hub gives
+ * a fresh History carousel, not yesterday's True Crime one).
  */
 function loadFromCache() {
+  const cacheKey = getCacheKey();
   try {
-    const raw = localStorage.getItem(CACHE_KEY);
+    const raw = localStorage.getItem(cacheKey);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (parsed?.dateKey !== getTodayKey()) return null;
@@ -88,15 +145,16 @@ function loadFromCache() {
   }
 }
 
-/** Persists the payload under today's key, with a timestamp. */
+/** Persists the payload under the active niche + today's key, with a timestamp. */
 function saveToCache(payload) {
   try {
     const record = {
       ...payload,
       dateKey: getTodayKey(),
+      niche: getNiche(activeNiche).id,
       cachedAt: new Date().toISOString(),
     };
-    localStorage.setItem(CACHE_KEY, JSON.stringify(record));
+    localStorage.setItem(getCacheKey(), JSON.stringify(record));
   } catch (err) {
     console.warn('[cache] failed to write:', err);
   }
@@ -108,12 +166,17 @@ function saveToCache(payload) {
 
 /**
  * Triggers the generation pipeline. Throws on network or server error.
+ * The active niche is forwarded to the backend so each engine
+ * ("True Crime", "History", ...) actually generates content scoped
+ * to that niche instead of generic events.
  */
 async function requestGeneration() {
   const response = await fetch(API_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({}),
+    body: JSON.stringify({
+      niche: getNiche(activeNiche).id,
+    }),
   });
 
   // Try to parse JSON either way — the backend always returns JSON for errors.
@@ -133,6 +196,55 @@ async function requestGeneration() {
   }
 
   return data;
+}
+
+/**
+ * Triggers the video generation pipeline. Throws on network or server
+ * error. Expects a JSON response shaped like:
+ *   { videos: [ { url, title?, year? }, ... ] }
+ * (or just an array of video objects — both are accepted so the
+ * backend can settle on one shape without breaking the client).
+ */
+async function requestVideoGeneration() {
+  const response = await fetch(VIDEO_API_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      niche: getNiche(activeNiche).id,
+    }),
+  });
+
+  // Parse JSON regardless of status — the backend always returns JSON for errors.
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error(`Server returned a non-JSON response (HTTP ${response.status}).`);
+  }
+
+  if (!response.ok) {
+    throw new Error(data?.error || `Request failed with status ${response.status}`);
+  }
+
+  // Accept either `{ videos: [...] }` or a bare array.
+  const videos = Array.isArray(data) ? data : data?.videos;
+  if (!Array.isArray(videos) || videos.length === 0) {
+    throw new Error('Server returned no videos.');
+  }
+
+  // Filter to entries that actually have a usable URL.
+  const playable = videos.filter((v) => v && (v.url || v.videoUrl || v.src));
+  if (playable.length === 0) {
+    throw new Error('Server returned videos without playable URLs.');
+  }
+
+  // Normalize the shape so the renderer doesn't have to care which
+  // field the backend used for the URL.
+  return playable.map((v) => ({
+    url: v.url || v.videoUrl || v.src,
+    title: v.title || '',
+    year: v.year || '',
+  }));
 }
 
 // ---------------------------------------------------------------------
@@ -194,6 +306,72 @@ function showError(message) {
   els.error.textContent = message;
   els.error.hidden = false;
   els.error.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+// ---------------------------------------------------------------------
+// Video UI state machines
+// ---------------------------------------------------------------------
+
+/**
+ * Show the video spinner, disable the video button, start the ticker
+ * and the asymptotic progress bar. Mirrors enterLoadingState() but
+ * with its own set of micro-copy and a longer tail (video jobs can
+ * take 3–6 minutes).
+ */
+function enterVideoLoadingState() {
+  els.videosError.hidden = true;
+  // Keep the previously rendered grid visible until the new payload
+  // arrives — it gets cleared/replaced on success.
+  els.videosLoading.hidden = false;
+  els.generateVideosBtn.disabled = true;
+  els.generateVideosBtnLabel.textContent = 'Generating Videos...';
+
+  // Smooth-scroll the spinner into view on small screens.
+  els.videosLoading.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  // Ticker — cycles through micro-copy every 4s. The first message
+  // is the spec-mandated copy and stays for the full first interval.
+  let idx = 0;
+  els.videosTicker.textContent = VIDEO_TICKER_MESSAGES[idx];
+  const tickerTimer = setInterval(() => {
+    idx = (idx + 1) % VIDEO_TICKER_MESSAGES.length;
+    els.videosTicker.style.opacity = '0';
+    setTimeout(() => {
+      els.videosTicker.textContent = VIDEO_TICKER_MESSAGES[idx];
+      els.videosTicker.style.opacity = '1';
+    }, 200);
+  }, 4000);
+
+  // Progress bar — asymptotic toward 95% (resets to 100 on success).
+  // Total animation ~5min, mirroring typical video backend latency.
+  let progress = 0;
+  els.videosProgressFill.style.width = '0%';
+  const progressTimer = setInterval(() => {
+    const remaining = 95 - progress;
+    progress += remaining * 0.025 + 0.2;
+    if (progress > 95) progress = 95;
+    els.videosProgressFill.style.width = `${progress.toFixed(1)}%`;
+  }, 500);
+
+  return () => {
+    clearInterval(tickerTimer);
+    clearInterval(progressTimer);
+    els.videosProgressFill.style.width = '100%';
+  };
+}
+
+/** Hide the video spinner; restore the video button. */
+function exitVideoLoadingState() {
+  els.videosLoading.hidden = true;
+  els.generateVideosBtn.disabled = false;
+  els.generateVideosBtnLabel.textContent = 'Regenerate Videos';
+}
+
+/** Show a video-specific error in the banner; restore the button. */
+function showVideoError(message) {
+  els.videosError.textContent = message;
+  els.videosError.hidden = false;
+  els.videosError.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 // ---------------------------------------------------------------------
@@ -355,6 +533,11 @@ function renderSlides(payload) {
 
   els.results.hidden = false;
 
+  // The videos section is a logical follow-up to the carousel — show
+  // it now that the daily events are on screen. The video button is
+  // its own CTA; the grid renders below it on click.
+  els.videos.hidden = false;
+
   // The "Generate" button is redundant once the carousel is on screen
   // (results are cached for the day, so re-running would just produce
   // the same images). Hide it as soon as every slide image has fired
@@ -452,6 +635,89 @@ function slugify(s) {
 }
 
 // ---------------------------------------------------------------------
+// Video rendering
+// ---------------------------------------------------------------------
+
+/**
+ * Renders one video card. Mirrors the slide card visually — same
+ * dark surface, same 9/16 media well, same year pill — so the two
+ * sections feel like part of the same system.
+ */
+function renderVideoCard(video, index) {
+  const card = document.createElement('article');
+  card.className = 'video-card';
+  card.style.animationDelay = `${index * 40}ms`;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'video-wrap';
+
+  // Native <video controls> — no custom player. `preload="metadata"`
+  // is light enough that 3 videos don't hammer the CDN on render.
+  const v = document.createElement('video');
+  v.controls = true;
+  v.preload = 'metadata';
+  v.playsInline = true;
+  v.src = video.url;
+  v.setAttribute('aria-label', video.title || `Generated video ${index + 1}`);
+
+  const year = document.createElement('span');
+  year.className = 'video-year';
+  year.textContent = video.year || `Clip ${index + 1}`;
+
+  wrap.append(v, year);
+
+  // Body
+  const body = document.createElement('div');
+  body.className = 'video-body';
+
+  const title = document.createElement('h3');
+  title.className = 'video-title';
+  title.textContent = video.title || `Video ${index + 1}`;
+
+  // Action row
+  const actions = document.createElement('div');
+  actions.className = 'video-actions';
+
+  const dl = document.createElement('a');
+  dl.className = 'download-btn';
+  dl.href = video.url;
+  dl.setAttribute('download', '');
+  dl.setAttribute('target', '_blank');
+  dl.setAttribute('rel', 'noopener noreferrer');
+  dl.innerHTML = `
+    <svg class="download-btn__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14" stroke="currentColor"
+        stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <span>Download</span>
+  `;
+
+  actions.append(dl);
+
+  body.append(title, actions);
+  card.append(wrap, body);
+  return card;
+}
+
+/**
+ * Mounts the videos array into the grid and updates the meta line.
+ * Accepts either a bare array or `{ videos: [...], generatedAt }`.
+ */
+function renderVideos(payload) {
+  const videos = Array.isArray(payload) ? payload : payload?.videos || [];
+  els.videoGrid.innerHTML = '';
+  videos.forEach((video, i) => {
+    els.videoGrid.appendChild(renderVideoCard(video, i));
+  });
+
+  const count = videos.length;
+  const when = timeAgo(payload?.generatedAt);
+  els.videosMeta.textContent = when
+    ? `${count} videos · ${when}`
+    : `${count} videos`;
+}
+
+// ---------------------------------------------------------------------
 // Main handler
 // ---------------------------------------------------------------------
 
@@ -475,6 +741,46 @@ async function handleGenerateClick() {
   }
 }
 
+/**
+ * Orchestrates a full video-generate → render cycle. Independent of
+ * the image flow — runs in parallel conceptually but is gated behind
+ * the videos section becoming visible (which only happens after the
+ * carousel is on screen).
+ */
+async function handleGenerateVideosClick() {
+  const stopLoading = enterVideoLoadingState();
+
+  try {
+    const videos = await requestVideoGeneration();
+    renderVideos({ videos, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    console.error('[generate-videos] error:', err);
+    showVideoError(
+      err?.message ||
+        'Something went wrong while generating videos. Check your connection and try again.'
+    );
+  } finally {
+    stopLoading();
+    exitVideoLoadingState();
+  }
+}
+
+// ---------------------------------------------------------------------
+// Niche badge — surfaces the active engine at the top of the dashboard.
+// The badge is also tied to the store subscription so if the user
+// opens /generator, switches the niche on / in another tab, the badge
+// (and cached grid) refreshes live without a page reload.
+// ---------------------------------------------------------------------
+function renderNicheBadge(nicheId) {
+  if (!els.nicheBadge || !els.nicheBadgeLabel) return;
+  const niche = getNiche(nicheId);
+  els.nicheBadgeLabel.textContent = niche.label;
+  // Tint the badge with the niche's gradient so the visual identity
+  // carries over from the hub card the user just clicked.
+  els.nicheBadge.style.setProperty('--niche-gradient', niche.gradient);
+  els.nicheBadge.hidden = false;
+}
+
 // ---------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------
@@ -482,13 +788,32 @@ function init() {
   // Show today's date in the header
   els.todayDate.textContent = getPrettyToday();
 
+  // Render the active niche badge (also re-renders on cross-tab changes).
+  renderNicheBadge(activeNiche);
+  subscribeActiveNiche((id) => {
+    activeNiche = id;
+    renderNicheBadge(id);
+    // If a payload is already on screen for the OLD niche, clear it
+    // so the user doesn't see a stale carousel under the new badge.
+    // They'll re-trigger generation (or hit the cache) explicitly.
+    if (!els.results.hidden) {
+      els.results.hidden = true;
+      els.videos.hidden = true;
+      els.generateBtn.hidden = false;
+    }
+  });
+
   // Wire up the primary action
   els.generateBtn.addEventListener('click', handleGenerateClick);
+  // Wire up the secondary "Generate Videos" action
+  els.generateVideosBtn.addEventListener('click', handleGenerateVideosClick);
 
-  // Instant-load from cache if we already have today's carousel
+  // Instant-load from cache if we already have today's carousel for
+  // the active niche. (Different niche → different cache key → cache
+  // miss → user clicks Generate.)
   const cached = loadFromCache();
   if (cached) {
-    console.info('[cache] rendering cached carousel for', cached.dateKey);
+    console.info('[cache] rendering cached carousel for', cached.dateKey, '·', getNiche(activeNiche).id);
     renderSlides(cached);
   }
 }

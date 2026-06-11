@@ -1,8 +1,15 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    { "source": "/generator", "destination": "/generator.html" }
+  ],
   "functions": {
     "api/generate-content.js": {
       "maxDuration": 60,
+      "supportsCancellation": true
+    },
+    "api/generate-daily-videos.js": {
+      "maxDuration": 300,
       "supportsCancellation": true
     }
   }

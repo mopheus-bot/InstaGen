@@ -1,0 +1,754 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      Mobile-first viewport with safe-area support so the UI looks
+      like a native app when "Added to Home Screen" on iOS/Android.
+    -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#0a0a0a" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="Daily carousel generator — pick a niche, ship 8 slides." />
+
+    <!-- PWA / iOS standalone meta tags -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="InstaGen" />
+    <meta name="format-detection" content="telephone=no" />
+
+    <title>InstaGen — Generator</title>
+
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%230a0a0a'/%3E%3Ctext x='50' y='66' font-family='-apple-system,sans-serif' font-size='52' font-weight='700' fill='white' text-anchor='middle'%3EI%3C/text%3E%3C/svg%3E" />
+
+    <style>
+      /* ----------------------------------------------------------------- */
+      /* Design tokens                                                       */
+      /* ----------------------------------------------------------------- */
+      :root {
+        --bg: #0a0a0a;
+        --bg-elev: #141414;
+        --bg-card: #1a1a1a;
+        --border: rgba(255, 255, 255, 0.08);
+        --text: #f5f5f5;
+        --text-dim: #a0a0a0;
+        --text-faint: #6a6a6a;
+        --accent: #ffffff;
+        --danger: #ff5a5a;
+        --radius: 16px;
+        --radius-sm: 10px;
+        --shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+        --font: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+        --font-serif: "New York", "Iowan Old Style", "Apple Garamond", Georgia,
+          "Times New Roman", serif;
+      }
+
+      * {
+        box-sizing: border-box;
+        -webkit-tap-highlight-color: transparent;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: var(--font);
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        overscroll-behavior-y: contain;
+      }
+
+      body {
+        min-height: 100vh;
+        min-height: 100dvh;
+        /* Respect the iOS notch / Android nav bar */
+        padding: env(safe-area-inset-top) env(safe-area-inset-right)
+          env(safe-area-inset-bottom) env(safe-area-inset-left);
+      }
+
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+
+      /* ----------------------------------------------------------------- */
+      /* Layout                                                              */
+      /* ----------------------------------------------------------------- */
+      .app {
+        max-width: 720px;
+        margin: 0 auto;
+        padding: 24px 20px 60px;
+      }
+
+      .app-header {
+        text-align: center;
+        padding: 16px 0 28px;
+      }
+
+      .app-title {
+        font-family: var(--font-serif);
+        font-size: clamp(28px, 7vw, 40px);
+        font-weight: 600;
+        letter-spacing: -0.02em;
+        margin: 0 0 6px;
+      }
+
+      .app-subtitle {
+        margin: 0;
+        color: var(--text-dim);
+        font-size: 14px;
+        letter-spacing: 0.02em;
+      }
+
+      .app-subtitle strong {
+        color: var(--text);
+        font-weight: 500;
+      }
+
+      /* ----------------------------------------------------------------- */
+      /* Top bar: niche badge + "change niche" link                          */
+      /* Shown above the title; surfaces the active engine at all times.    */
+      /* ----------------------------------------------------------------- */
+      .top-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 18px;
+      }
+
+      .niche-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 12px 7px 8px;
+        background: var(--bg-elev);
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--text);
+        max-width: 100%;
+        /* Inherits a subtle gradient from the niche via a CSS var. */
+        background-image: var(--niche-gradient, none);
+        background-color: var(--bg-elev);
+        background-blend-mode: overlay;
+      }
+
+      .niche-badge__dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #fff;
+        box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.12);
+        flex-shrink: 0;
+      }
+
+      .niche-badge__label {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 100%;
+      }
+
+      .niche-change {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--text-dim);
+        padding: 7px 10px;
+        border-radius: 999px;
+        transition: color 200ms ease, background 200ms ease;
+        flex-shrink: 0;
+      }
+
+      .niche-change:hover {
+        color: var(--text);
+        background: var(--bg-elev);
+      }
+
+      .niche-change svg {
+        width: 12px;
+        height: 12px;
+      }
+
+      /* ----------------------------------------------------------------- */
+      /* Primary action button                                              */
+      /* ----------------------------------------------------------------- */
+      .generate-btn {
+        width: 100%;
+        padding: 22px 24px;
+        background: var(--accent);
+        color: #000;
+        border: none;
+        border-radius: var(--radius);
+        font-family: inherit;
+        font-size: 17px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        cursor: pointer;
+        transition: transform 120ms ease, opacity 200ms ease, background 200ms ease;
+        box-shadow: var(--shadow);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+      }
+
+      .generate-btn:hover {
+        transform: translateY(-1px);
+      }
+
+      .generate-btn:active {
+        transform: translateY(0) scale(0.99);
+      }
+
+      .generate-btn:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+        transform: none;
+      }
+
+      .generate-btn__icon {
+        width: 20px;
+        height: 20px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      /* ----------------------------------------------------------------- */
+      /* Loading state                                                       */
+      /* ----------------------------------------------------------------- */
+      .loading {
+        margin-top: 28px;
+        padding: 36px 24px;
+        background: var(--bg-elev);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        text-align: center;
+      }
+
+      .spinner {
+        width: 44px;
+        height: 44px;
+        margin: 0 auto 18px;
+        border: 3px solid var(--border);
+        border-top-color: var(--accent);
+        border-radius: 50%;
+        animation: spin 0.9s linear infinite;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      .loading-ticker {
+        font-size: 15px;
+        color: var(--text);
+        min-height: 22px;
+        font-weight: 500;
+        transition: opacity 250ms ease;
+      }
+
+      .loading-progress {
+        margin-top: 8px;
+        font-size: 12px;
+        color: var(--text-faint);
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .progress-bar {
+        margin-top: 18px;
+        height: 3px;
+        background: var(--bg-card);
+        border-radius: 3px;
+        overflow: hidden;
+      }
+
+      .progress-bar__fill {
+        height: 100%;
+        width: 0%;
+        background: var(--accent);
+        border-radius: 3px;
+        transition: width 600ms ease;
+      }
+
+      /* ----------------------------------------------------------------- */
+      /* Error banner                                                        */
+      /* ----------------------------------------------------------------- */
+      .error-banner {
+        margin-top: 20px;
+        padding: 14px 16px;
+        background: rgba(255, 90, 90, 0.1);
+        border: 1px solid rgba(255, 90, 90, 0.3);
+        border-radius: var(--radius-sm);
+        color: var(--danger);
+        font-size: 14px;
+        line-height: 1.4;
+      }
+
+      /* ----------------------------------------------------------------- */
+      /* Results grid                                                        */
+      /* ----------------------------------------------------------------- */
+      .results {
+        margin-top: 36px;
+      }
+
+      .results-header {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        margin-bottom: 18px;
+        padding: 0 4px;
+      }
+
+      .results-title {
+        font-family: var(--font-serif);
+        font-size: 22px;
+        font-weight: 600;
+        margin: 0;
+        letter-spacing: -0.01em;
+      }
+
+      .results-meta {
+        font-size: 12px;
+        color: var(--text-faint);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+
+      .slide-grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 18px;
+      }
+
+      @media (min-width: 640px) {
+        .slide-grid {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+
+      /* ----------------------------------------------------------------- */
+      /* Slide card                                                          */
+      /* ----------------------------------------------------------------- */
+      .slide {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        transition: transform 200ms ease;
+      }
+
+      .slide:active {
+        transform: scale(0.99);
+      }
+
+      .slide-image-wrap {
+        position: relative;
+        aspect-ratio: 9 / 16;
+        background: var(--bg-elev);
+        overflow: hidden;
+      }
+
+      .slide-image {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+        opacity: 0;
+        transition: opacity 400ms ease;
+      }
+
+      .slide-image.loaded {
+        opacity: 1;
+      }
+
+      .slide-year {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        padding: 6px 10px;
+        background: rgba(0, 0, 0, 0.7);
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+      }
+
+      .slide-body {
+        padding: 16px 18px 18px;
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+      }
+
+      .slide-title {
+        font-family: var(--font-serif);
+        font-size: 18px;
+        font-weight: 600;
+        line-height: 1.25;
+        margin: 0 0 8px;
+        letter-spacing: -0.01em;
+      }
+
+      .slide-description {
+        font-size: 14px;
+        line-height: 1.5;
+        color: var(--text-dim);
+        margin: 0 0 16px;
+        flex: 1;
+      }
+
+      .slide-actions {
+        display: flex;
+        gap: 8px;
+      }
+
+      .download-btn {
+        flex: 1;
+        padding: 11px 14px;
+        background: transparent;
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        font-family: inherit;
+        font-size: 13px;
+        font-weight: 500;
+        cursor: pointer;
+        transition: background 200ms ease, border-color 200ms ease;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+      }
+
+      .download-btn:hover {
+        background: rgba(255, 255, 255, 0.05);
+        border-color: rgba(255, 255, 255, 0.2);
+      }
+
+      .download-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      .download-btn__icon {
+        width: 14px;
+        height: 14px;
+      }
+
+      .copy-text-btn {
+        align-self: flex-start;
+        margin: -6px 0 14px;
+        padding: 4px 0;
+        background: transparent;
+        border: none;
+        color: var(--text-faint);
+        font-family: inherit;
+        font-size: 11px;
+        font-weight: 500;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        cursor: pointer;
+        transition: color 200ms ease;
+      }
+
+      .copy-text-btn:hover {
+        color: var(--text);
+      }
+
+      .copy-text-btn:active {
+        transform: scale(0.97);
+      }
+
+      .copy-text-btn.copied {
+        color: #6ee7a3;
+      }
+
+      /* ----------------------------------------------------------------- */
+      /* Secondary action button — used for "Generate Videos"               */
+      /* ----------------------------------------------------------------- */
+      .generate-btn--secondary {
+        background: transparent;
+        color: var(--text);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        box-shadow: none;
+        padding: 18px 22px;
+        font-size: 15px;
+      }
+
+      .generate-btn--secondary:hover {
+        background: rgba(255, 255, 255, 0.06);
+        border-color: rgba(255, 255, 255, 0.35);
+        transform: translateY(-1px);
+      }
+
+      .generate-btn--secondary:active {
+        transform: translateY(0) scale(0.99);
+      }
+
+      .generate-btn--secondary:disabled {
+        background: transparent;
+        border-color: var(--border);
+        color: var(--text-faint);
+        opacity: 1;
+        cursor: not-allowed;
+        transform: none;
+      }
+
+      /* ----------------------------------------------------------------- */
+      /* Video section                                                      */
+      /* ----------------------------------------------------------------- */
+      .videos {
+        margin-top: 36px;
+      }
+
+      .videos-header {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        margin: 0 0 18px;
+        padding: 0 4px;
+      }
+
+      .videos-title {
+        font-family: var(--font-serif);
+        font-size: 22px;
+        font-weight: 600;
+        margin: 0;
+        letter-spacing: -0.01em;
+      }
+
+      .videos-meta {
+        font-size: 12px;
+        color: var(--text-faint);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+
+      .video-grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 18px;
+        margin-top: 18px;
+      }
+
+      @media (min-width: 640px) {
+        .video-grid {
+          grid-template-columns: repeat(3, 1fr);
+        }
+      }
+
+      .video-card {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .video-wrap {
+        position: relative;
+        aspect-ratio: 9 / 16;
+        background: #000;
+        overflow: hidden;
+      }
+
+      .video-wrap video {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+        background: #000;
+      }
+
+      .video-year {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        padding: 6px 10px;
+        background: rgba(0, 0, 0, 0.7);
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        z-index: 1;
+        pointer-events: none;
+      }
+
+      .video-body {
+        padding: 16px 18px 18px;
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+      }
+
+      .video-title {
+        font-family: var(--font-serif);
+        font-size: 16px;
+        font-weight: 600;
+        line-height: 1.25;
+        margin: 0 0 14px;
+        letter-spacing: -0.01em;
+      }
+
+      .video-actions {
+        display: flex;
+        gap: 8px;
+        margin-top: auto;
+      }
+
+      /* ----------------------------------------------------------------- */
+      /* Footer                                                              */
+      /* ----------------------------------------------------------------- */
+      .app-footer {
+        margin-top: 40px;
+        text-align: center;
+        font-size: 12px;
+        color: var(--text-faint);
+        letter-spacing: 0.04em;
+      }
+
+      /* ----------------------------------------------------------------- */
+      /* Utility                                                             */
+      /* ----------------------------------------------------------------- */
+      [hidden] {
+        display: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <!-- Top bar: niche badge (set by app.js on mount) + back-to-hub link. -->
+      <div class="top-bar">
+        <div id="niche-badge" class="niche-badge" hidden>
+          <span class="niche-badge__dot" aria-hidden="true"></span>
+          <span id="niche-badge__label" class="niche-badge__label">—</span>
+        </div>
+        <a class="niche-change" href="/" aria-label="Change niche">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M19 12H5M12 19l-7-7 7-7"></path>
+          </svg>
+          <span>Change</span>
+        </a>
+      </div>
+
+      <header class="app-header">
+        <h1 class="app-title">InstaGen</h1>
+        <p class="app-subtitle">
+          Eight moments for
+          <strong id="today-date">today</strong>
+        </p>
+      </header>
+
+      <button id="generate-btn" class="generate-btn" type="button">
+        <span class="generate-btn__icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" width="20" height="20">
+            <path
+              d="M12 2v3M12 19v3M4.93 4.93l2.12 2.12M16.95 16.95l2.12 2.12M2 12h3M19 12h3M4.93 19.07l2.12-2.12M16.95 7.05l2.12-2.12"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+            />
+            <circle cx="12" cy="12" r="4" fill="currentColor" />
+          </svg>
+        </span>
+        <span id="generate-btn__label">Generate Today's Content</span>
+      </button>
+
+      <!-- Loading state — shown while a generation is in flight -->
+      <section id="loading" class="loading" hidden>
+        <div class="spinner" aria-label="Loading"></div>
+        <div id="ticker" class="loading-ticker">Researching history...</div>
+        <div class="loading-progress">This usually takes 60–90 seconds</div>
+        <div class="progress-bar" aria-hidden="true">
+          <div id="progress-fill" class="progress-bar__fill"></div>
+        </div>
+      </section>
+
+      <!-- Error banner — only rendered if /api/generate-content fails -->
+      <div id="error" class="error-banner" hidden></div>
+
+      <!-- Results grid — populated after a successful generation -->
+      <section id="results" class="results" hidden>
+        <div class="results-header">
+          <h2 class="results-title">Your Carousel</h2>
+          <span id="results-meta" class="results-meta"></span>
+        </div>
+        <div id="slide-grid" class="slide-grid"></div>
+      </section>
+
+      <!-- Video generation — appears once the carousel is on screen.
+           Button is the entry point; click triggers a long-running
+           backend job; the grid of 3 video players renders below. -->
+      <section id="videos" class="videos" hidden>
+        <div class="videos-header">
+          <h2 class="videos-title">Daily Videos</h2>
+          <span id="videos-meta" class="videos-meta"></span>
+        </div>
+
+        <button
+          id="generate-videos-btn"
+          class="generate-btn generate-btn--secondary"
+          type="button"
+        >
+          <span class="generate-btn__icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" width="20" height="20">
+              <path
+                d="M5 4l14 8-14 8V4z"
+                fill="currentColor"
+              />
+            </svg>
+          </span>
+          <span id="generate-videos-btn__label">Generate Videos</span>
+        </button>
+
+        <!-- Loading state — shown while /api/generate-daily-videos is in flight -->
+        <section id="videos-loading" class="loading" hidden>
+          <div class="spinner" aria-label="Loading"></div>
+          <div id="videos-ticker" class="loading-ticker">
+            Analyzing Day's Events &amp; Generating Videos...
+          </div>
+          <div class="loading-progress">This can take a few minutes</div>
+          <div class="progress-bar" aria-hidden="true">
+            <div id="videos-progress-fill" class="progress-bar__fill"></div>
+          </div>
+        </section>
+
+        <!-- Error banner — only rendered if /api/generate-daily-videos fails -->
+        <div id="videos-error" class="error-banner" hidden></div>
+
+        <!-- Video grid — populated after a successful generation -->
+        <div id="video-grid" class="video-grid"></div>
+      </section>
+
+      <footer class="app-footer">
+        Generated locally · Cached for today
+      </footer>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
