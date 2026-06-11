@@ -270,9 +270,20 @@ async function generateImageSafely(apiKey, imagePrompt, slideIndex) {
 }
 
 // ---------------------------------------------------------------------
+// Response helper — wraps a JS value in a Web Fetch API Response so the
+// handler works on both the Node.js and Edge Vercel runtimes.
+// ---------------------------------------------------------------------
+function jsonResponse(body, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...extraHeaders },
+  });
+}
+
+// ---------------------------------------------------------------------
 // Handler — exported as default so Vercel picks it up as the function
-// entry point. Signature is (req, res) to match Vercel's serverless
-// request/response interface.
+// entry point. Uses the Web Fetch API (Request → Response) so it works
+// on both the Node.js and Edge Vercel runtimes.
 // ---------------------------------------------------------------------
 
 // Last-resort safety net. If anything in the handler throws outside the
@@ -286,19 +297,22 @@ process.on('unhandledRejection', (reason) => {
   console.error('[unhandledRejection]', reason);
 });
 
-export default async function handler(req, res) {
+export default async function handler(req) {
   // Method guard — this endpoint is POST-only.
   if (req.method !== 'POST') {
-    res.setHeader('Allow', 'POST');
-    return res.status(405).json({ error: 'Method not allowed.' });
+    return jsonResponse(
+      { error: 'Method not allowed.' },
+      405,
+      { Allow: 'POST' }
+    );
   }
 
   // --- Auth / config guard -----------------------------------------
   const apiKey = process.env.MINIMAX_API_KEY;
   if (!apiKey) {
-    return res.status(500).json({
+    return jsonResponse({
       error: 'Server misconfigured: MINIMAX_API_KEY is not set.',
-    });
+    }, 500);
   }
 
   // --- Date context (computed on every invocation) -----------------
@@ -335,16 +349,16 @@ export default async function handler(req, res) {
     } catch (parseErr) {
       console.error('[parse] failed:', parseErr.message);
       console.error('[parse] raw snippet:', rawLlmText.slice(0, 500));
-      return res.status(502).json({
+      return jsonResponse({
         error: 'Model output could not be parsed as a JSON array.',
         details: parseErr.message,
-      });
+      }, 502);
     }
 
     if (!Array.isArray(events) || events.length === 0) {
-      return res.status(502).json({
+      return jsonResponse({
         error: 'Model output parsed to an empty or non-array value.',
-      });
+      }, 502);
     }
 
     // Cap to TARGET_SLIDE_COUNT and normalize each entry. We ship what
@@ -382,7 +396,7 @@ export default async function handler(req, res) {
       imageUrl: imageUrls[idx],
     }));
 
-    return res.status(200).json({
+    return jsonResponse({
       dateKey,                                // YYYY-MM-DD (cache key)
       generatedAt: new Date().toISOString(),  // ISO timestamp
       slides,
@@ -393,9 +407,9 @@ export default async function handler(req, res) {
     // etc). Per-slice image failures are handled inside
     // generateImageSafely and never reach here.
     console.error('[pipeline] fatal:', err);
-    return res.status(500).json({
+    return jsonResponse({
       error: 'Generation pipeline failed.',
       details: err.message,
-    });
+    }, 500);
   }
 }
