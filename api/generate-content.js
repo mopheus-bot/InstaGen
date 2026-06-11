@@ -87,15 +87,23 @@ const HISTORICAL_AGENT_SYSTEM_PROMPT = [
 /**
  * The historical-archivist text-generation agent.
  *
- * Issues a single POST to the MiniMax text-generation endpoint,
- * pinned to the MiniMax-M3 model, with the strict archivist system
- * prompt that forces a raw JSON-array response. The returned string
- * is the raw `data.choices[0].message.content` payload (with a
- * couple of belt-and-suspenders fallbacks in case the gateway shape
- * ever varies).
+ * Issues a single POST to the MiniMax Anthropic-compatible endpoint
+ * (https://api.minimax.io/anthropic/v1/messages), pinned to the
+ * MiniMax-M3 model, with the strict archivist system prompt delivered
+ * via the top-level `system` field (per the Anthropic Messages API
+ * contract — NOT as a {role:"system"} entry in the messages array).
+ *
+ * Response shape (Anthropic Messages):
+ *   { content: [
+ *       { type: "thinking", thinking: "..." },   // optional, may appear first
+ *       { type: "text",     text:     "..." },
+ *       ...
+ *     ] }
+ *
+ * We extract the first `text` block (skipping any `thinking` blocks).
  *
  * @param {string} currentDate  Human-readable date (e.g., "January 7").
- * @returns {Promise<string>}   The raw assistant content string.
+ * @returns {Promise<string>}   The raw assistant text content.
  * @throws  If the request fails, the response is non-2xx, or the
  *          body is empty.
  */
@@ -106,12 +114,18 @@ async function runHistoricalTextAgent(currentDate) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      // Anthropic SDK normally uses `x-api-key`; MiniMax's gateway
+      // accepts either, and we keep the Bearer form for parity with
+      // the image endpoint.
       Authorization: `Bearer ${apiKey}`,
+      // Pin the Anthropic Messages protocol version MiniMax emulates.
+      'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
       model: 'MiniMax-M3',
+      // System prompt lives at the top level in the Anthropic format.
+      system: HISTORICAL_AGENT_SYSTEM_PROMPT,
       messages: [
-        { role: 'system', content: HISTORICAL_AGENT_SYSTEM_PROMPT },
         { role: 'user', content: `Today is ${currentDate}. Return the 8 historical events for this date as a raw JSON array.` },
       ],
       // 0.6 balances factual historical accuracy with engaging,
@@ -130,9 +144,15 @@ async function runHistoricalTextAgent(currentDate) {
 
   const data = await response.json();
 
-  // Primary path per spec: data.choices[0].message.content.
-  // Fallbacks cover gateways that nest the reply under alternate fields.
+  // Primary: Anthropic Messages shape — `content` is an array of blocks.
+  // Find the first block whose type is "text" and return its `text`.
+  const content = Array.isArray(data?.content) ? data.content : [];
+  const textBlock = content.find((b) => b && b.type === 'text');
+
+  // Fallbacks: OpenAI chat-completions shape and a few other
+  // belt-and-suspenders fields in case the gateway ever varies.
   return (
+    textBlock?.text ??
     data?.choices?.[0]?.message?.content ??
     data?.reply ??
     data?.output?.text ??
@@ -206,7 +226,13 @@ function normalizeEvent(raw, index) {
 
 /**
  * Calls the MiniMax image-generation endpoint for a single prompt.
- * Returns a hosted image URL string, or throws on transport / API error.
+ * Returns a `data:image/jpeg;base64,...` URL string ready to drop
+ * into an <img src=...>, or throws on transport / API error.
+ *
+ * Per MiniMax's docs, the response shape is:
+ *   { data: { image_base64: [ "<b64>", "<b64>", ... ] } }
+ * We request `response_format: "base64"` so the gateway returns the
+ * image bytes inline (no CORS, no expiry, no extra HTTP hop).
  */
 async function callImageAPI(apiKey, imagePrompt) {
   const fullPrompt = `${imagePrompt}${AESTHETIC_SUFFIX}`;
@@ -221,7 +247,7 @@ async function callImageAPI(apiKey, imagePrompt) {
       model: 'image-01',
       prompt: fullPrompt,
       aspect_ratio: '1:1',
-      n: 1,
+      response_format: 'base64',
     }),
   });
 
@@ -234,15 +260,28 @@ async function callImageAPI(apiKey, imagePrompt) {
 
   const data = await response.json();
 
-  // Try every plausible field the gateway might use.
-  return (
+  // Primary path: MiniMax Anthropic/OpenAI-compatible gateway returns
+  // { data: { image_base64: [ "<b64>", ... ] } }. Wrap the first
+  // entry as a data URL the browser can render directly.
+  const base64Array = data?.data?.image_base64;
+  if (Array.isArray(base64Array) && base64Array.length > 0 && base64Array[0]) {
+    return `data:image/jpeg;base64,${base64Array[0]}`;
+  }
+
+  // Fallback chain in case the gateway ever returns a hosted URL
+  // (older API versions, alternative regions, etc.).
+  const hostedUrl =
     data?.data?.[0]?.url ??
     data?.images?.[0]?.url ??
     data?.images?.[0] ??
     data?.image_url ??
     data?.output?.image_url ??
-    null
-  );
+    null;
+  if (hostedUrl) return hostedUrl;
+
+  // Nothing recognizable in the response — let the caller fall back
+  // to the placeholder via the existing null check in generateImageSafely.
+  return null;
 }
 
 /**
