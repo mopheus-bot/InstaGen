@@ -22,7 +22,7 @@
 // ---------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------
-const TEXT_API_URL = 'https://api.minimax.io/v1/text_generation';
+const TEXT_API_URL = 'https://api.minimax.io/anthropic/v1/messages';
 const IMAGE_API_URL = 'https://api.minimax.io/v1/image_generation';
 const PLACEHOLDER_IMAGE = '/assets/placeholder-error.png';
 
