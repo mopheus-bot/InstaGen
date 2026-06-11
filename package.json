@@ -1,22 +1,8 @@
 {
   "name": "instagen",
   "version": "1.0.0",
-  "description": "Internal tool to generate historical Instagram carousel posts via MiniMax text and image APIs.",
   "type": "module",
-  "main": "api/generate-content.js",
   "engines": {
     "node": ">=18.0.0"
-  },
-  "scripts": {
-    "dev": "vercel dev"
-  },
-  "keywords": [
-    "instagram",
-    "carousel",
-    "minimax",
-    "ai",
-    "historical"
-  ],
-  "author": "",
-  "license": "ISC"
+  }
 }
