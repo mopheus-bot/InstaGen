@@ -1,21 +1,8 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "version": 2,
-  "routes": [
-    {
-      "src": "/generate-content",
-      "dest": "server.js"
-    },
-    {
-      "handle": "filesystem"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "public/$1"
-    }
-  ],
   "functions": {
-    "server.js": {
+    "api/generate-content.js": {
       "maxDuration": 300
     }
   }
