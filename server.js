@@ -24,6 +24,14 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import serverless from 'serverless-http';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// ESM doesn't expose __dirname by default — derive it from import.meta.url
+// so the static file path resolves correctly no matter where node was
+// launched from (project root, a subfolder, an IDE terminal, etc.).
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 dotenv.config();
 
@@ -67,7 +75,19 @@ app.use((req, _res, next) => {
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
-app.use(express.static('public', { maxAge: '1h', extensions: ['html'] }));
+
+// Serve the frontend. The path is resolved against THIS file's location
+// (via __dirname above), not the process CWD — so it works even if
+// the server is launched from a different folder.
+const PUBLIC_DIR = path.join(__dirname, 'public');
+app.use(express.static(PUBLIC_DIR, { maxAge: '1h', extensions: ['html'] }));
+
+// Explicit root route — belt-and-suspenders fallback in case the static
+// middleware's index-file lookup is ever bypassed (e.g. trailing slash
+// quirks, custom Vercel rewrites, etc.). Sends the same index.html.
+app.get('/', (_req, res) => {
+  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+});
 
 // ---------------------------------------------------------------------
 // Helpers
@@ -367,6 +387,7 @@ if (!isServerless) {
   app.listen(PORT, () => {
     console.log(`InstaGen server listening on port ${PORT}`);
     console.log(`MiniMax API base: ${MINIMAX_API_BASE}`);
+    console.log(`Serving static files from: ${PUBLIC_DIR}`);
   });
 }
 
