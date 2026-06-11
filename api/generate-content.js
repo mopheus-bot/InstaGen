@@ -274,6 +274,18 @@ async function generateImageSafely(apiKey, imagePrompt, slideIndex) {
 // entry point. Signature is (req, res) to match Vercel's serverless
 // request/response interface.
 // ---------------------------------------------------------------------
+
+// Last-resort safety net. If anything in the handler throws outside the
+// top-level try/catch (unhandled async rejection, sync throw from a
+// top-level constant initializer, etc.), catch it and try to send a
+// 500 instead of letting Vercel surface FUNCTION_INVOCATION_FAILED.
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+});
+
 export default async function handler(req, res) {
   // Method guard — this endpoint is POST-only.
   if (req.method !== 'POST') {
