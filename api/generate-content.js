@@ -368,6 +368,20 @@ process.on('unhandledRejection', (reason) => {
   console.error('[unhandledRejection]', reason);
 });
 
+export async function GET() {
+  // Friendly response for direct browser hits (e.g., someone pasting
+  // the URL into the address bar). The actual app flow is via POST
+  // from public/app.js.
+  return jsonResponse(
+    {
+      error: 'Method not allowed.',
+      hint: 'This endpoint accepts POST only. Load the app at the site root to trigger generation.',
+    },
+    405,
+    { Allow: 'POST' }
+  );
+}
+
 export async function POST(request) {
   // No method guard needed — Vercel only invokes the POST() export
   // for POST requests. GET/PUT/etc. get a 405 from Vercel itself.
