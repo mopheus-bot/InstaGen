@@ -252,37 +252,18 @@ function renderSlide(slide, index) {
   desc.className = 'slide-description';
   desc.textContent = slide.description || '';
 
-  // Image prompt — full, scrollable, copyable. The textarea is the
-  // cheapest way to let the user select-all + copy the verbatim text
-  // (the requirement: "make the entire image prompt viewable for each
-  // image so the user can copy the text in its entirety").
-  const promptSection = document.createElement('div');
-  promptSection.className = 'slide-prompt';
-
-  const promptHeader = document.createElement('div');
-  promptHeader.className = 'slide-prompt-header';
-
-  const promptLabel = document.createElement('span');
-  promptLabel.className = 'slide-prompt-label';
-  promptLabel.textContent = 'Image Prompt';
-
-  const copyBtn = document.createElement('button');
-  copyBtn.className = 'copy-btn';
-  copyBtn.type = 'button';
-  copyBtn.textContent = 'Copy';
-  copyBtn.setAttribute('aria-label', 'Copy image prompt to clipboard');
-  copyBtn.addEventListener('click', () => copyPrompt(copyBtn, promptText));
-
-  promptHeader.append(promptLabel, copyBtn);
-
-  const promptText = document.createElement('textarea');
-  promptText.className = 'slide-prompt-text';
-  promptText.readOnly = true;
-  promptText.value = slide.imagePrompt || '';
-  promptText.spellcheck = false;
-  promptText.setAttribute('aria-label', 'Image prompt text');
-
-  promptSection.append(promptHeader, promptText);
+  // One-tap "Copy description" affordance. The description is rendered
+  // as plain text (not truncated, fully selectable on its own); this
+  // button is just a shortcut so the user doesn't have to triple-click
+  // + ⌘C every time.
+  const copyDescBtn = document.createElement('button');
+  copyDescBtn.className = 'copy-text-btn';
+  copyDescBtn.type = 'button';
+  copyDescBtn.textContent = 'Copy description';
+  copyDescBtn.setAttribute('aria-label', 'Copy description to clipboard');
+  copyDescBtn.addEventListener('click', () =>
+    copyToClipboard(copyDescBtn, slide.description || '')
+  );
 
   // Action row
   const actions = document.createElement('div');
@@ -302,19 +283,19 @@ function renderSlide(slide, index) {
 
   actions.append(dl);
 
-  body.append(title, desc, promptSection, actions);
+  body.append(title, desc, copyDescBtn, actions);
   card.append(imgWrap, body);
   return card;
 }
 
 /**
- * Copies the textarea's value to the clipboard. Falls back to a
- * hidden <textarea> + execCommand('copy') on browsers/environments
- * where the async Clipboard API is unavailable (e.g. insecure
- * contexts, very old mobile browsers).
+ * Copies an arbitrary string to the clipboard and flashes a "Copied"
+ * hint on the triggering button. Falls back to a hidden <textarea> +
+ * execCommand('copy') on browsers/environments where the async
+ * Clipboard API is unavailable (e.g. insecure contexts, very old
+ * mobile browsers).
  */
-async function copyPrompt(button, textarea) {
-  const text = textarea.value;
+async function copyToClipboard(button, text) {
   if (!text) return;
 
   const flashCopied = () => {
@@ -337,15 +318,23 @@ async function copyPrompt(button, textarea) {
     /* fall through to legacy path */
   }
 
-  // Legacy fallback: select the textarea contents and exec copy.
+  // Legacy fallback: stage a temporary textarea, select, exec copy.
+  let staging;
   try {
-    textarea.removeAttribute('readonly');
-    textarea.select();
+    staging = document.createElement('textarea');
+    staging.value = text;
+    staging.setAttribute('readonly', '');
+    staging.style.position = 'fixed';
+    staging.style.opacity = '0';
+    staging.style.pointerEvents = 'none';
+    document.body.appendChild(staging);
+    staging.select();
     const ok = document.execCommand('copy');
-    textarea.setAttribute('readonly', '');
     if (ok) flashCopied();
   } catch (err) {
     console.warn('[copy] failed:', err);
+  } finally {
+    if (staging) staging.remove();
   }
 }
 
