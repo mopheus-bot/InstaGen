@@ -1,13 +1,23 @@
 // =====================================================================
 // InstaGen — Express backend (secure proxy + generation orchestrator)
 // =====================================================================
-// Run with:    npm start          (long-lived process, for local + Render)
-// Deploy to:   Vercel             (auto-detected via VERCEL env var)
+// Architecture:
+//   1. Serves the static frontend from /public
+//   2. Exposes POST /api/generate-content which:
+//        a. Resolves today's calendar date (month + day)
+//        b. Calls the MiniMax text API (model: MiniMax-M3) with a rigid
+//           system prompt that forces a raw JSON array of 8 events
+//        c. Sanitizes + parses the LLM output defensively (with a
+//           regex-extract fallback if JSON.parse fails)
+//        d. Fires 8 image-generation calls in parallel via Promise.all
+//           (model: image-01, endpoint /v1/image_generation), appending
+//           a hard-coded aesthetic suffix to every prompt
+//        e. Per-image failures are isolated — a placeholder is returned
+//           for any failed slice, so the rest of the carousel still ships
+//        f. Returns the assembled payload { date, slides[] } to the client
 //
-// Endpoints:
-//   GET  /                  → serves public/index.html
-//   GET  /api/health        → liveness probe
-//   POST /api/generate-content → runs the 8-event generation pipeline
+//   3. Runs as a long-lived Node process on Render, or as a serverless
+//      function on Vercel (auto-detected via env var).
 // =====================================================================
 
 import express from 'express';
@@ -72,8 +82,9 @@ app.use(express.json({ limit: '2mb' }));
 const PUBLIC_DIR = path.join(__dirname, 'public');
 app.use(express.static(PUBLIC_DIR, { maxAge: '1h', extensions: ['html'] }));
 
-// Explicit root route — belt-and-suspenders fallback that always works
-// regardless of static-middleware edge cases.
+// Explicit root route — belt-and-suspenders fallback in case the static
+// middleware's index-file lookup is ever bypassed (e.g. trailing slash
+// quirks, custom Vercel rewrites, etc.). Sends the same index.html.
 app.get('/', (_req, res) => {
   res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
@@ -84,7 +95,8 @@ app.get('/', (_req, res) => {
 
 /**
  * Resolves today's calendar date as { month, day, fullDate }.
- * Uses the server's local timezone.
+ * Uses the server's local timezone, which is exactly what the user asked
+ * for ("dynamically determine today's current date ... in the system").
  */
 function getTodayContext() {
   const now = new Date();
@@ -363,7 +375,7 @@ app.post('/api/generate-content', async (req, res) => {
   }
 });
 
-// 404 fallback for /api/* (returns JSON so the frontend can parse it).
+// 404 fallback for /api/* (so the SPA index doesn't mask a bad route).
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found.' }));
 
 // ---------------------------------------------------------------------
