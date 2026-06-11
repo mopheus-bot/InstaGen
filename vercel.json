@@ -2,7 +2,8 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
     "api/generate-content.js": {
-      "maxDuration": 60
+      "maxDuration": 60,
+      "supportsCancellation": true
     }
   }
 }

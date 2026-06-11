@@ -102,12 +102,19 @@ const HISTORICAL_AGENT_SYSTEM_PROMPT = [
  *
  * We extract the first `text` block (skipping any `thinking` blocks).
  *
- * @param {string} currentDate  Human-readable date (e.g., "January 7").
- * @returns {Promise<string>}   The raw assistant text content.
+ * @param {string}        currentDate  Human-readable date (e.g., "January 7").
+ * @param {AbortSignal}   [signal]     Optional AbortSignal — typically
+ *                                     `request.signal` from the Vercel
+ *                                     Web Handler. When the client
+ *                                     disconnects, the in-flight fetch
+ *                                     is cancelled (Vercel must have
+ *                                     `supportsCancellation: true` for
+ *                                     the signal to actually fire).
+ * @returns {Promise<string>}          The raw assistant text content.
  * @throws  If the request fails, the response is non-2xx, or the
  *          body is empty.
  */
-async function runHistoricalTextAgent(currentDate) {
+async function runHistoricalTextAgent(currentDate, signal) {
   const apiKey = process.env.MINIMAX_API_KEY;
 
   const response = await fetch(TEXT_API_URL, {
@@ -133,6 +140,9 @@ async function runHistoricalTextAgent(currentDate) {
       temperature: 0.6,
       max_tokens: 4096,
     }),
+    // Forward the AbortSignal so a client disconnect cancels the
+    // upstream fetch instead of leaving it running.
+    signal,
   });
 
   if (!response.ok) {
@@ -233,8 +243,14 @@ function normalizeEvent(raw, index) {
  *   { data: { image_base64: [ "<b64>", "<b64>", ... ] } }
  * We request `response_format: "base64"` so the gateway returns the
  * image bytes inline (no CORS, no expiry, no extra HTTP hop).
+ *
+ * @param {string}      apiKey
+ * @param {string}      imagePrompt
+ * @param {AbortSignal} [signal]  Forwarded AbortSignal — when the
+ *                                client disconnects, the in-flight
+ *                                image request is cancelled.
  */
-async function callImageAPI(apiKey, imagePrompt) {
+async function callImageAPI(apiKey, imagePrompt, signal) {
   const fullPrompt = `${imagePrompt}${AESTHETIC_SUFFIX}`;
 
   const response = await fetch(IMAGE_API_URL, {
@@ -249,6 +265,9 @@ async function callImageAPI(apiKey, imagePrompt) {
       aspect_ratio: '1:1',
       response_format: 'base64',
     }),
+    // Forward the AbortSignal so a client disconnect cancels the
+    // upstream fetch instead of leaving it running.
+    signal,
   });
 
   if (!response.ok) {
@@ -290,19 +309,30 @@ async function callImageAPI(apiKey, imagePrompt) {
  * network hiccup, malformed response) NEVER poisons the whole carousel —
  * the failing slice just gets the local placeholder, and the remaining
  * successful slides still return uninterrupted.
+ *
+ * @param {string}      apiKey
+ * @param {string}      imagePrompt
+ * @param {number}      slideIndex
+ * @param {AbortSignal} [signal]  Forwarded to callImageAPI. If the
+ *                                client disconnects mid-flight, the
+ *                                AbortError is rethrown so the entire
+ *                                pipeline terminates (no point
+ *                                continuing to spend API credits on a
+ *                                response that has no listener).
  */
-async function generateImageSafely(apiKey, imagePrompt, slideIndex) {
+async function generateImageSafely(apiKey, imagePrompt, slideIndex, signal) {
   try {
-    const url = await callImageAPI(apiKey, imagePrompt);
+    const url = await callImageAPI(apiKey, imagePrompt, signal);
     if (!url) {
       console.error(`[image] slice ${slideIndex}: no URL in response, using placeholder`);
       return PLACEHOLDER_IMAGE;
     }
     return url;
   } catch (err) {
-    // Log and fall through to the placeholder. Note we intentionally
-    // do NOT rethrow — the Promise.all() must complete so the response
-    // can still be assembled for the surviving slices.
+    // Rethrow AbortError so the pipeline stops cleanly on client
+    // disconnect. All other errors (rate limit, network hiccup,
+    // malformed response) fall through to the placeholder.
+    if (err?.name === 'AbortError') throw err;
     console.error(`[image] slice ${slideIndex} failed: ${err.message}`);
     return PLACEHOLDER_IMAGE;
   }
@@ -320,9 +350,11 @@ function jsonResponse(body, status = 200, extraHeaders = {}) {
 }
 
 // ---------------------------------------------------------------------
-// Handler — exported as default so Vercel picks it up as the function
-// entry point. Uses the Web Fetch API (Request → Response) so it works
-// on both the Node.js and Edge Vercel runtimes.
+// Handler — exported as a NAMED export per HTTP method (Web Fetch API
+// signature). Vercel's auto-detector looks for `GET`, `POST`, etc. —
+// using `export default` would have been misread as the legacy
+// `(req, res) => void` Node.js signature and our return value would
+// have been ignored. Named export = unambiguous, future-proof.
 // ---------------------------------------------------------------------
 
 // Last-resort safety net. If anything in the handler throws outside the
@@ -336,15 +368,15 @@ process.on('unhandledRejection', (reason) => {
   console.error('[unhandledRejection]', reason);
 });
 
-export default async function handler(req) {
-  // Method guard — this endpoint is POST-only.
-  if (req.method !== 'POST') {
-    return jsonResponse(
-      { error: 'Method not allowed.' },
-      405,
-      { Allow: 'POST' }
-    );
-  }
+export async function POST(request) {
+  // No method guard needed — Vercel only invokes the POST() export
+  // for POST requests. GET/PUT/etc. get a 405 from Vercel itself.
+  //
+  // `request` is the standard Web Request object (per the Vercel
+  // Functions API Reference). We don't read the body, but we do
+  // forward `request.signal` to the upstream fetch calls so a client
+  // disconnect cancels the in-flight MiniMax requests instead of
+  // leaving them to run to completion (and burn API credits).
 
   // --- Auth / config guard -----------------------------------------
   const apiKey = process.env.MINIMAX_API_KEY;
@@ -367,7 +399,7 @@ export default async function handler(req) {
     // Hand the dynamically-resolved current date to the agent. The
     // agent itself is responsible for assembling the request body,
     // pinning the model, and authenticating.
-    const rawLlmText = await runHistoricalTextAgent(prettyDate);
+    const rawLlmText = await runHistoricalTextAgent(prettyDate, request.signal);
 
     if (!rawLlmText) {
       throw new Error('Text API returned empty content.');
@@ -411,17 +443,19 @@ export default async function handler(req) {
     // STEP 2 — Concurrent image generation via image-01
     // -----------------------------------------------------------------
     // 8 requests fire in parallel via Promise.all. Each is wrapped in
-    // generateImageSafely() which catches its own errors internally,
-    // so a single failure cannot reject the whole Promise.all() and
-    // take down the entire carousel.
+    // generateImageSafely() which catches its own non-Abort errors
+    // internally and falls back to the placeholder, so a single
+    // failure cannot reject the whole Promise.all() and take down
+    // the entire carousel. AbortError (client disconnect) is
+    // rethrown so the pipeline terminates cleanly.
     console.log(`[image] dispatching ${targetEvents.length} parallel requests ...`);
     const imageUrls = await Promise.all(
       targetEvents.map((event, idx) =>
-        generateImageSafely(apiKey, event.image_prompt, idx)
+        generateImageSafely(apiKey, event.image_prompt, idx, request.signal)
       )
     );
 
-    const successCount = imageUrls.filter((u) => u !== PLACEHOLDER_IMAGE).length;
+    const successCount = imageUrls.filter((u) => u !== PLACEHOLDER_IMAGE && !u.startsWith('data:image/')).length;
     console.log(`[image] ${successCount}/${targetEvents.length} succeeded`);
 
     // -----------------------------------------------------------------
