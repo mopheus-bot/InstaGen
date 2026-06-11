@@ -252,6 +252,38 @@ function renderSlide(slide, index) {
   desc.className = 'slide-description';
   desc.textContent = slide.description || '';
 
+  // Image prompt — full, scrollable, copyable. The textarea is the
+  // cheapest way to let the user select-all + copy the verbatim text
+  // (the requirement: "make the entire image prompt viewable for each
+  // image so the user can copy the text in its entirety").
+  const promptSection = document.createElement('div');
+  promptSection.className = 'slide-prompt';
+
+  const promptHeader = document.createElement('div');
+  promptHeader.className = 'slide-prompt-header';
+
+  const promptLabel = document.createElement('span');
+  promptLabel.className = 'slide-prompt-label';
+  promptLabel.textContent = 'Image Prompt';
+
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'copy-btn';
+  copyBtn.type = 'button';
+  copyBtn.textContent = 'Copy';
+  copyBtn.setAttribute('aria-label', 'Copy image prompt to clipboard');
+  copyBtn.addEventListener('click', () => copyPrompt(copyBtn, promptText));
+
+  promptHeader.append(promptLabel, copyBtn);
+
+  const promptText = document.createElement('textarea');
+  promptText.className = 'slide-prompt-text';
+  promptText.readOnly = true;
+  promptText.value = slide.imagePrompt || '';
+  promptText.spellcheck = false;
+  promptText.setAttribute('aria-label', 'Image prompt text');
+
+  promptSection.append(promptHeader, promptText);
+
   // Action row
   const actions = document.createElement('div');
   actions.className = 'slide-actions';
@@ -270,9 +302,51 @@ function renderSlide(slide, index) {
 
   actions.append(dl);
 
-  body.append(title, desc, actions);
+  body.append(title, desc, promptSection, actions);
   card.append(imgWrap, body);
   return card;
+}
+
+/**
+ * Copies the textarea's value to the clipboard. Falls back to a
+ * hidden <textarea> + execCommand('copy') on browsers/environments
+ * where the async Clipboard API is unavailable (e.g. insecure
+ * contexts, very old mobile browsers).
+ */
+async function copyPrompt(button, textarea) {
+  const text = textarea.value;
+  if (!text) return;
+
+  const flashCopied = () => {
+    const original = button.textContent;
+    button.textContent = 'Copied';
+    button.classList.add('copied');
+    setTimeout(() => {
+      button.textContent = original;
+      button.classList.remove('copied');
+    }, 1500);
+  };
+
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      flashCopied();
+      return;
+    }
+  } catch {
+    /* fall through to legacy path */
+  }
+
+  // Legacy fallback: select the textarea contents and exec copy.
+  try {
+    textarea.removeAttribute('readonly');
+    textarea.select();
+    const ok = document.execCommand('copy');
+    textarea.setAttribute('readonly', '');
+    if (ok) flashCopied();
+  } catch (err) {
+    console.warn('[copy] failed:', err);
+  }
 }
 
 /** Mounts the slide array into the grid. */
@@ -291,6 +365,44 @@ function renderSlides(payload) {
     : `${slideCount} slides · ${when}`;
 
   els.results.hidden = false;
+
+  // The "Generate" button is redundant once the carousel is on screen
+  // (results are cached for the day, so re-running would just produce
+  // the same images). Hide it as soon as every slide image has fired
+  // its load/error event — that's the "after images are loaded" gate.
+  scheduleGenerateButtonHiding();
+}
+
+/**
+ * Waits for every slide image to load (or error out) and then hides
+ * the primary generate button. Handles the case where some images
+ * are already in the browser cache (img.complete is true) before the
+ * `load` event can fire, otherwise the button would never get hidden.
+ */
+function scheduleGenerateButtonHiding() {
+  const imgs = els.slideGrid.querySelectorAll('.slide-image');
+  if (imgs.length === 0) {
+    els.generateBtn.hidden = true;
+    return;
+  }
+
+  let remaining = imgs.length;
+  const onSettled = () => {
+    remaining -= 1;
+    if (remaining === 0) {
+      els.generateBtn.hidden = true;
+    }
+  };
+
+  imgs.forEach((img) => {
+    if (img.complete && img.naturalWidth > 0) {
+      // Already loaded (e.g. browser cache hit) — settle on next tick.
+      onSettled();
+      return;
+    }
+    img.addEventListener('load', onSettled, { once: true });
+    img.addEventListener('error', onSettled, { once: true });
+  });
 }
 
 // ---------------------------------------------------------------------

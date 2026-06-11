@@ -292,7 +292,7 @@
 
       .slide-image-wrap {
         position: relative;
-        aspect-ratio: 1 / 1;
+        aspect-ratio: 9 / 16;
         background: var(--bg-elev);
         overflow: hidden;
       }
@@ -384,6 +384,88 @@
       .download-btn__icon {
         width: 14px;
         height: 14px;
+      }
+
+      /* ----------------------------------------------------------------- */
+      /* Image prompt                                                        */
+      /* ----------------------------------------------------------------- */
+      .slide-prompt {
+        margin: 4px 0 0;
+        padding-top: 14px;
+        border-top: 1px solid var(--border);
+      }
+
+      .slide-prompt-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+
+      .slide-prompt-label {
+        font-size: 11px;
+        color: var(--text-faint);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-weight: 500;
+      }
+
+      .copy-btn {
+        padding: 5px 10px;
+        background: transparent;
+        color: var(--text-dim);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        font-family: inherit;
+        font-size: 11px;
+        font-weight: 500;
+        letter-spacing: 0.02em;
+        cursor: pointer;
+        transition: background 200ms ease, color 200ms ease,
+          border-color 200ms ease;
+      }
+
+      .copy-btn:hover {
+        background: rgba(255, 255, 255, 0.05);
+        color: var(--text);
+        border-color: rgba(255, 255, 255, 0.2);
+      }
+
+      .copy-btn:active {
+        transform: scale(0.97);
+      }
+
+      .copy-btn.copied {
+        color: #6ee7a3;
+        border-color: rgba(110, 231, 163, 0.3);
+      }
+
+      .slide-prompt-text {
+        display: block;
+        width: 100%;
+        min-height: 90px;
+        max-height: 240px;
+        padding: 10px 12px;
+        background: var(--bg-elev);
+        color: var(--text-dim);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono",
+          monospace;
+        font-size: 12px;
+        line-height: 1.55;
+        resize: vertical;
+        white-space: pre-wrap;
+        word-break: break-word;
+        /* No truncation — the user wants the entire prompt viewable
+           and copyable. The textarea's max-height + scroll handle
+           long prompts without cutting any text off. */
+      }
+
+      .slide-prompt-text:focus {
+        outline: none;
+        border-color: rgba(255, 255, 255, 0.2);
       }
 
       /* ----------------------------------------------------------------- */

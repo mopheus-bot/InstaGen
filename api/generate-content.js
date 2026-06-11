@@ -262,7 +262,7 @@ async function callImageAPI(apiKey, imagePrompt, signal) {
     body: JSON.stringify({
       model: 'image-01',
       prompt: fullPrompt,
-      aspect_ratio: '1:1',
+      aspect_ratio: '9:16',
       response_format: 'base64',
     }),
     // Forward the AbortSignal so a client disconnect cancels the
@@ -480,6 +480,10 @@ export async function POST(request) {
       year: event.year,
       title: event.title,
       description: event.description,
+      // Surface the full image prompt so the UI can show + let the user
+      // copy it. The prompt is the verbatim text we sent to the image
+      // model (including the AESTHETIC_SUFFIX it was suffixed with).
+      imagePrompt: `${event.image_prompt}${AESTHETIC_SUFFIX}`,
       imageUrl: imageUrls[idx],
     }));
 
