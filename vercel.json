@@ -3,7 +3,7 @@
   "version": 2,
   "routes": [
     {
-      "src": "/api/generate-content",
+      "src": "/generate-content",
       "dest": "server.js"
     },
     {
