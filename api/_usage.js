@@ -51,6 +51,7 @@ let totals = {
   textInputTokens:  0,
   textOutputTokens: 0,
   imageCount:       0,
+  videoCount:       0,
   videoSeconds:     0,
   usd:              0,
   events:           0,
@@ -68,10 +69,43 @@ let totalToday = {
   textInputTokens:  0,
   textOutputTokens: 0,
   imageCount:       0,
+  videoCount:       0,
   videoSeconds:     0,
   usd:              0,
   events:           0,
 };
+
+// "This week" mirrors the today counter but for a SUNDAY-8PM window
+// (the project's chosen reset boundary — easy to remember, off-peak
+// traffic time). Like today, the rollover is lazy: we check the
+// current week key on every recordUsage() call and reset the
+// accumulator on the first call after a new window starts.
+//
+// Weekly window math:
+//   - The week STARTS at the most recent Sunday at 8:00 PM and
+//     ENDS at the next Sunday at 8:00 PM.
+//   - If "now" is Sunday 7:00 PM, the active week is the one that
+//     started the PREVIOUS Sunday at 8:00 PM (it ends in 1 hour).
+//   - If "now" is Sunday 9:00 PM, the active week is the one that
+//     JUST started (1 hour ago) and ends 7 days later.
+//   - If "now" is Wednesday 10:00 AM, the active week started
+//     Sunday 8:00 PM (~62 hours ago) and ends next Sunday 8:00 PM.
+let weekKey = currentWeekKey();
+let totalThisWeek = {
+  textInputTokens:  0,
+  textOutputTokens: 0,
+  imageCount:       0,
+  videoCount:       0,
+  videoSeconds:     0,
+  usd:              0,
+  events:           0,
+};
+
+// Maximum number of tokens allowed in a single weekly window.
+// When the operator's running total approaches this cap the
+// dashboard shows a red progress bar; the cap is informational
+// (no calls are blocked) but it makes a runaway burn obvious.
+const WEEKLY_TOKEN_CAP = 200_000_000;
 
 function currentDateKey() {
   // YYYY-MM-DD in the server's local timezone. Matches the key
@@ -79,6 +113,117 @@ function currentDateKey() {
   // admin's "today" lines up with the carousel's date.
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/**
+ * Returns the SUNDAY-8PM-aligned week key for the current moment.
+ * Encoded as "YYYY-Www" (ISO-style week) plus a suffix that
+ * disambiguates the half-week so a Sunday 7:00 PM and a Sunday
+ * 9:00 PM land in different buckets:
+ *
+ *   - "YYYY-Www:a" = the window that is about to END (resets at
+ *     the upcoming Sunday 8:00 PM)
+ *   - "YYYY-Www:b" = the window that JUST STARTED (the next reset
+ *     is 7 days from now)
+ *
+ * Examples for a server running in 2026 (all times server-local):
+ *
+ *   Mon 10:00 AM  → "2026-W25:b"   (started Sun Jun 8 8 PM,
+ *                                   ends Sun Jun 15 8 PM)
+ *   Sun  7:00 PM  → "2026-W25:a"   (started Sun Jun 1 8 PM,
+ *                                   ends Sun Jun 8 8 PM in 1 hour)
+ *   Sun  9:00 PM  → "2026-W25:b"   (started Sun Jun 8 8 PM,
+ *                                   ends Sun Jun 15 8 PM)
+ *   Sat 11:59 PM  → "2026-W25:b"   (still inside the same window
+ *                                   that started Sun Jun 8 8 PM)
+ *
+ * The ISO week number (Www) is computed from a date inside the
+ * current window so the operator can eyeball which week they're in
+ * on the dashboard.
+ */
+function currentWeekKey() {
+  const now = new Date();
+  // Day of week: 0 = Sun, 1 = Mon, ..., 6 = Sat (local time).
+  const dow = now.getDay();
+  // Minutes since the most recent Sunday 8:00 PM. If "now" is
+  // before 8:00 PM on Sunday, we're still inside the window that
+  // started the PREVIOUS Sunday (suffix ":a"); otherwise the
+  // current window started THIS Sunday (suffix ":b").
+  const sinceMidnight = now.getHours() * 60 + now.getMinutes();
+  const sundayCutoff  = 20 * 60; // 8:00 PM = 20:00
+  const sameSundayStarted =
+    dow === 0 && sinceMidnight >= sundayCutoff;
+
+  // Pick the anchor Sunday for the current window: if we're in the
+  // "started this Sunday" half, the anchor is today; otherwise it's
+  // the most recent Sunday (1–6 days back).
+  const anchor = new Date(now);
+  if (sameSundayStarted) {
+    // anchor is today, Sunday 8 PM onward.
+  } else if (dow === 0) {
+    // Sunday but before 8 PM — the window started the previous
+    // Sunday (7 days back).
+    anchor.setDate(anchor.getDate() - 7);
+  } else {
+    // Mon–Sat: the window started the most recent Sunday.
+    anchor.setDate(anchor.getDate() - dow);
+  }
+  // ISO week number of the anchor (and the year, which can differ
+  // from the calendar year at year boundaries).
+  const tmp = new Date(Date.UTC(anchor.getFullYear(), anchor.getMonth(), anchor.getDate()));
+  // Shift to the nearest Thursday: the ISO week-1 contains Jan 4,
+  // so Thursday of the anchor's week is the canonical marker.
+  tmp.setUTCDate(tmp.getUTCDate() + 4 - (tmp.getUTCDay() || 7));
+  const isoYear = tmp.getUTCFullYear();
+  const isoWeek = Math.ceil((((tmp - new Date(Date.UTC(isoYear, 0, 1))) / 86400000) + 1) / 7);
+  const suffix = sameSundayStarted ? 'b' : 'a';
+  return `${isoYear}-W${String(isoWeek).padStart(2, '0')}:${suffix}`;
+}
+
+/**
+ * Human-readable label for the current weekly window, e.g.
+ *   "Sun Jun 8 8:00 PM → Sun Jun 15 8:00 PM"
+ * Used in the admin dashboard so the operator can see exactly
+ * when the next reset is, not just an opaque key.
+ */
+function currentWeekLabel() {
+  const now = new Date();
+  const dow = now.getDay();
+  const sinceMidnight = now.getHours() * 60 + now.getMinutes();
+  const sameSundayStarted =
+    dow === 0 && sinceMidnight >= 20 * 60;
+  const anchor = new Date(now);
+  if (!sameSundayStarted && dow === 0) anchor.setDate(anchor.getDate() - 7);
+  else if (dow !== 0) anchor.setDate(anchor.getDate() - dow);
+  // The "end" is anchor + 7 days at 8:00 PM (the cutover instant).
+  const start = new Date(anchor);
+  start.setHours(20, 0, 0, 0);
+  const end = new Date(anchor);
+  end.setDate(end.getDate() + 7);
+  end.setHours(20, 0, 0, 0);
+  const fmt = (d) =>
+    d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }) +
+    ' ' + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  return `${fmt(start)} → ${fmt(end)}`;
+}
+
+/**
+ * Milliseconds remaining until the next Sunday-8PM reset. Used by
+ * the admin UI to show a countdown ("resets in 4d 13h 22m").
+ */
+function msUntilWeekReset() {
+  const now = new Date();
+  const dow = now.getDay();
+  const sinceMidnight = now.getHours() * 60 + now.getMinutes();
+  const sameSundayStarted = dow === 0 && sinceMidnight >= 20 * 60;
+  // If we're in the "starts this Sunday" half, the next reset is
+  // the Sunday 7 days from now. Otherwise it's the upcoming
+  // Sunday (0–6 days from now, in the same week).
+  const daysAhead = sameSundayStarted ? 7 : (dow === 0 ? 0 : 7 - dow);
+  const target = new Date(now);
+  target.setDate(target.getDate() + daysAhead);
+  target.setHours(20, 0, 0, 0);
+  return target.getTime() - now.getTime();
 }
 
 function rolloverTodayIfNeeded() {
@@ -89,6 +234,23 @@ function rolloverTodayIfNeeded() {
       textInputTokens:  0,
       textOutputTokens: 0,
       imageCount:       0,
+      videoCount:       0,
+      videoSeconds:     0,
+      usd:              0,
+      events:           0,
+    };
+  }
+}
+
+function rolloverWeekIfNeeded() {
+  const k = currentWeekKey();
+  if (k !== weekKey) {
+    weekKey = k;
+    totalThisWeek = {
+      textInputTokens:  0,
+      textOutputTokens: 0,
+      imageCount:       0,
+      videoCount:       0,
       videoSeconds:     0,
       usd:              0,
       events:           0,
@@ -98,6 +260,7 @@ function rolloverTodayIfNeeded() {
 
 function append(entry) {
   rolloverTodayIfNeeded();
+  rolloverWeekIfNeeded();
 
   log.push(entry);
   if (log.length > LOG_SIZE) log.shift();
@@ -107,6 +270,7 @@ function append(entry) {
   totals.textInputTokens  += entry.textInputTokens  || 0;
   totals.textOutputTokens += entry.textOutputTokens || 0;
   totals.imageCount       += entry.imageCount       || 0;
+  totals.videoCount       += entry.videoCount       || 0;
   totals.videoSeconds     += entry.videoSeconds     || 0;
   totals.usd              += entry.usd              || 0;
 
@@ -117,8 +281,20 @@ function append(entry) {
   totalToday.textInputTokens  += entry.textInputTokens  || 0;
   totalToday.textOutputTokens += entry.textOutputTokens || 0;
   totalToday.imageCount       += entry.imageCount       || 0;
+  totalToday.videoCount       += entry.videoCount       || 0;
   totalToday.videoSeconds     += entry.videoSeconds     || 0;
   totalToday.usd              += entry.usd              || 0;
+
+  // Weekly bucket — same shape as totalToday but with a Sunday-8PM
+  // rollover. Used by the admin dashboard to show a "weekly
+  // balance" capped at WEEKLY_TOKEN_CAP.
+  totalThisWeek.events          += 1;
+  totalThisWeek.textInputTokens  += entry.textInputTokens  || 0;
+  totalThisWeek.textOutputTokens += entry.textOutputTokens || 0;
+  totalThisWeek.imageCount       += entry.imageCount       || 0;
+  totalThisWeek.videoCount       += entry.videoCount       || 0;
+  totalThisWeek.videoSeconds     += entry.videoSeconds     || 0;
+  totalThisWeek.usd              += entry.usd              || 0;
 }
 
 // ---------------------------------------------------------------------
@@ -254,6 +430,7 @@ export async function recordUsage(opts) {
     entry.videoCount ? `videos: ${entry.videoCount} × ${entry.videoSeconds}s` : null,
     `this call: ${fmtUsd(entry.usd)}`,
     `today (${todayDateKey}): ${fmtUsd(totalToday.usd)} across ${totalToday.events} call(s)`,
+    `this week (${weekKey}): ${fmtUsd(totalThisWeek.usd)} across ${totalThisWeek.events} call(s)`,
     `running total: ${fmtUsd(totals.usd)} across ${totals.events} call(s)`,
     `ip: ${entry.ip || 'unknown'}`,
   ].filter(Boolean);
@@ -267,6 +444,7 @@ export async function recordUsage(opts) {
 // ---------------------------------------------------------------------
 export function getUsageSnapshot() {
   rolloverTodayIfNeeded();
+  rolloverWeekIfNeeded();
   return {
     rateCard: { ...PRICE },
     totals: { ...totals },
@@ -275,23 +453,35 @@ export function getUsageSnapshot() {
     // see at a glance how much today's traffic has cost.
     total_today: { ...totalToday },
     today_date: todayDateKey,
+    // `total_week` is the per-week running total in the
+    // Sunday-8PM-aligned window. The dashboard renders it with a
+    // cap (WEEKLY_TOKEN_CAP), a percent-of-cap bar, and a
+    // countdown to the next reset.
+    total_week: { ...totalThisWeek },
+    week_key: weekKey,
+    week_label: currentWeekLabel(),
+    week_token_cap: WEEKLY_TOKEN_CAP,
+    week_resets_in_ms: msUntilWeekReset(),
     log: log.slice().reverse(),   // newest first
   };
 }
 
 export function clearUsageLog() {
   rolloverTodayIfNeeded();
+  rolloverWeekIfNeeded();
   log.length = 0;
   totals = {
     textInputTokens:  0,
     textOutputTokens: 0,
     imageCount:       0,
+    videoCount:       0,
     videoSeconds:     0,
     usd:              0,
     events:           0,
   };
-  // `total_today` is intentionally NOT reset here — clearing
-  // the log should not make the day's running cost disappear.
+  // `total_today` and `total_week` are intentionally NOT reset
+  // here — clearing the log should not make the day's or week's
+  // running cost disappear. To reset those, restart the process.
   return { ok: true };
 }
 

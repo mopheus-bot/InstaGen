@@ -30,6 +30,8 @@ import { resolveNicheProfile } from './niche_profiles.js';
 import { buildNicheQuery } from './niche_queries.js';
 import { withCors, getClientIp } from './_request.js';
 import { recordUsage } from './_usage.js';
+import { setDailyContent } from './daily_content_store.js';
+import { r2PutObject, r2Configured } from './cf_r2.js';
 
 // ---------------------------------------------------------------------
 // Constants
@@ -446,6 +448,43 @@ async function callImageAPI(apiKey, imagePrompt, styleSuffix, signal) {
  *                                     on a response that has no
  *                                     listener).
  */
+/**
+ * Decode a data:image/jpeg;base64,… string into raw JPEG bytes.
+ * Returns null on any parse error. Used by the R2 upload step
+ * below — the carousel store and the in-flight response are
+ * JSON-friendly URLs, so the base64 bytes never travel further
+ * than the immediate upload.
+ */
+function dataUrlToJpegBytes(dataUrl) {
+  const m = /^data:image\/jpeg;base64,(.+)$/i.exec(dataUrl);
+  if (!m) return null;
+  return Buffer.from(m[1], 'base64');
+}
+
+/**
+ * Hand the generated JPEG bytes to Cloudflare R2 and return the
+ * public URL. Returns null if R2 is unconfigured, the input is
+ * not a data: URL we recognise, or the upload fails. The caller
+ * falls back to the data: URL in those cases so the carousel
+ * still renders.
+ */
+async function uploadImageToR2(slideIndex, nicheId, dateKey, imageUrl) {
+  if (!r2Configured()) return null;
+  if (typeof imageUrl !== 'string' || !imageUrl.startsWith('data:image/')) return null;
+  const bytes = dataUrlToJpegBytes(imageUrl);
+  if (!bytes) return null;
+  // Key: images/<dateKey>/<niche>/<slide-index>.jpg — flat enough
+  // for the R2 console to scan, namespaced enough that two niches
+  // on the same day don't collide.
+  const key = `images/${dateKey}/${nicheId}/slice-${String(slideIndex).padStart(2, '0')}.jpg`;
+  try {
+    return await r2PutObject({ key, body: bytes, contentType: 'image/jpeg' });
+  } catch (err) {
+    console.error(`[r2] image slice ${slideIndex} upload failed: ${err.message}`);
+    return null;
+  }
+}
+
 async function generateImageSafely(apiKey, imagePrompt, slideIndex, styleSuffix, signal) {
   try {
     const url = await callImageAPI(apiKey, imagePrompt, styleSuffix, signal);
@@ -643,6 +682,42 @@ export const POST = withCors(async (request, ctx) => {
     );
 
     // -----------------------------------------------------------------
+    // STEP 2.4 — Offload image bytes to Cloudflare R2 (best-effort)
+    // -----------------------------------------------------------------
+    // If R2 is configured, upload each successful data: URL to the
+    // bucket and replace it in the response with the public URL.
+    // The original data: URL is kept as the fallback so the
+    // carousel still renders when R2 is unreachable. The bytes
+    // never sit in server memory — we decode, hash, and stream
+    // straight to R2 inside `r2PutObject`.
+    //
+    // Note: the upload happens AFTER Promise.all so a single slow
+    // R2 PUT doesn't bottleneck the burst. Total wall-clock is
+    // `min(8 × R2 latency)` not `sum`, but we still log the count.
+    if (r2Configured()) {
+      const r2Results = await Promise.allSettled(
+        imageUrls.map((url, idx) =>
+          uploadImageToR2(idx, profile.id, dateKey, url).then(
+            (r2Url) => ({ idx, r2Url })
+          )
+        )
+      );
+      let r2Ok = 0, r2Fail = 0;
+      for (const r of r2Results) {
+        if (r.status === 'fulfilled' && r.value.r2Url) {
+          imageUrls[r.value.idx] = r.value.r2Url;
+          r2Ok++;
+        } else {
+          r2Fail++;
+        }
+      }
+      console.log(
+        `[r2] image upload: ${r2Ok}/${imageUrls.length} succeeded` +
+        (r2Fail ? ` (${r2Fail} fell back to data: URL)` : '')
+      );
+    }
+
+    // -----------------------------------------------------------------
     // STEP 2.5 — Record usage (text + images) for the admin alert.
     // -----------------------------------------------------------------
     // Two separate recordUsage calls: one for the text agent (token
@@ -682,13 +757,24 @@ export const POST = withCors(async (request, ctx) => {
       imageUrl: imageUrls[idx],
     }));
 
-    return jsonResponse({
+    const responsePayload = {
       dateKey,                                // YYYY-MM-DD (cache key)
       generatedAt: new Date().toISOString(),  // ISO timestamp
       niche: profile.id,                      // echoed back for client display
       nicheLabel: profile.label,              // human-readable label
       slides,
+    };
+
+    // Persist to the daily content store (in-memory + Cloudflare KV
+    // with TTL = seconds until next midnight). Fire-and-forget — the
+    // user gets the response immediately; the KV write completes
+    // in the background. setDailyContent stamps the payload with
+    // the current dateKey so the read path can verify freshness.
+    setDailyContent('carousel', profile.id, responsePayload).catch((err) => {
+      console.error('[daily-content] write carousel failed:', err.message);
     });
+
+    return jsonResponse(responsePayload);
   } catch (err) {
     // Catches anything that escaped the inner try/catches (text-API
     // failure, normalizeEvent throwing on a truly malformed object,

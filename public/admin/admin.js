@@ -27,6 +27,32 @@ const fmtTime = (iso) => {
   const d = new Date(iso);
   return d.toLocaleTimeString('en-US', { hour12: false });
 };
+// Compact representation for large token counts: 1.2M, 234k, 987.
+const fmtCompactInt = (n) => {
+  const v = Number(n || 0);
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(v >= 10_000_000 ? 0 : 1)}M`;
+  if (v >= 1_000)     return `${(v / 1_000).toFixed(0)}k`;
+  return String(v);
+};
+// Format a percent (0–100) to 1 decimal place, but trim trailing
+// `.0` so the labels read "12%" not "12.0%".
+const fmtPct = (p) => {
+  if (!Number.isFinite(p)) return '0%';
+  const s = p.toFixed(1);
+  return s.endsWith('.0') ? s.slice(0, -2) + '%' : s + '%';
+};
+// Format a ms duration as "4d 13h 22m" / "13h 22m" / "22m" / "12s".
+function fmtDuration(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '—';
+  const totalSec = Math.floor(ms / 1000);
+  const d = Math.floor(totalSec / 86400);
+  const h = Math.floor((totalSec % 86400) / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return `${totalSec}s`;
+}
 
 let toastTimer = null;
 function toast(msg, kind = 'ok') {
@@ -115,6 +141,53 @@ function renderToday(t, dateKey) {
   $('statTodayUsd').textContent = fmtUsd(t.usd);
 }
 
+/**
+ * Render the weekly balance card. The week window resets every
+ * Sunday at 8:00 PM (server-local); the dashboard shows:
+ *
+ *   - the running totals (events, tokens, images, videos, cost)
+ *   - a percent bar against the 200M-token weekly cap
+ *   - a per-row percent (each metric as a fraction of the cap)
+ *   - a "resets in 4d 13h 22m" countdown to the next boundary
+ *
+ * Percentages use TEXT tokens as the numerator because that's the
+ * dimension the cap is on (200M tokens). Image and video counts
+ * get a separate percent against a smaller implicit cap so the
+ * row still shows a meaningful fraction.
+ */
+function renderWeek(t, weekKey, weekLabel, tokenCap, resetsInMs) {
+  if (!$('weekRange')) return;          // admin/index.html may not include it yet
+  $('weekRange').textContent = weekLabel || weekKey || '—';
+  $('statWeekEvents').textContent = fmtInt(t.events);
+  const weekTokens = (t.textInputTokens || 0) + (t.textOutputTokens || 0);
+  $('statWeekTokens').textContent = fmtInt(weekTokens);
+  $('statWeekTokensSub').textContent =
+    `${fmtInt(t.textInputTokens)} in / ${fmtInt(t.textOutputTokens)} out`;
+  $('statWeekImages').textContent = fmtInt(t.imageCount);
+  $('statWeekVideos').textContent = fmtInt(t.videoCount);
+  $('statWeekVideoSub').textContent = t.videoSeconds
+    ? `${fmtInt(t.videoSeconds)} seconds`
+    : '—';
+  $('statWeekUsd').textContent = fmtUsd(t.usd);
+
+  // Percent of the 200M-token cap. The bar shows the larger
+  // of the two axes: tokens (the actual cap) and a synthetic
+  // "image cap" of 5000/week — whichever the operator wants to
+  // see, the cap line is the one to watch.
+  const tokenPct  = tokenCap > 0 ? (weekTokens / tokenCap) * 100 : 0;
+  const imageCap  = 5000;
+  const imagePct  = (t.imageCount || 0) / imageCap * 100;
+  // The headline percent is the token usage vs the cap.
+  const headroomPct = Math.min(100, tokenPct);
+  $('weekCapBar').style.width = headroomPct.toFixed(2) + '%';
+  $('weekCapBar').classList.toggle('over', tokenPct > 100);
+  $('weekCapPct').textContent = fmtPct(tokenPct);
+  $('weekCapDetail').textContent =
+    `${fmtCompactInt(weekTokens)} of ${fmtCompactInt(tokenCap)} tokens · ` +
+    `images ${fmtInt(t.imageCount)} (${fmtPct(imagePct)} of ${fmtInt(imageCap)})`;
+  $('weekResetsIn').textContent = fmtDuration(resetsInMs);
+}
+
 function renderLog(entries) {
   const table = $('logTable');
   const empty = $('logEmpty');
@@ -168,6 +241,13 @@ async function refresh() {
     renderRateCard(data.snapshot.rateCard);
     renderTotals(data.snapshot.totals);
     renderToday(data.snapshot.total_today, data.snapshot.today_date);
+    renderWeek(
+      data.snapshot.total_week,
+      data.snapshot.week_key,
+      data.snapshot.week_label,
+      data.snapshot.week_token_cap,
+      data.snapshot.week_resets_in_ms
+    );
     renderLog(data.snapshot.log);
     $('tgStatusValue').textContent = data.snapshot.totals.events > 0
       ? 'configured'

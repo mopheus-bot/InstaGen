@@ -58,6 +58,10 @@ import { resolveNicheProfile } from './niche_profiles.js';
 import { buildNicheQuery } from './niche_queries.js';
 import { withCors, getClientIp, getPublicOrigin } from './_request.js';
 import { recordUsage } from './_usage.js';
+import { setDailyContent } from './daily_content_store.js';
+import { r2PutObject, r2Configured } from './cf_r2.js';
+import { submitVideoTask, pollVideoTask } from './minimax_api.js';
+import { setVideoTask } from './video_task_store.js';
 
 // ---------------------------------------------------------------------
 // Constants
@@ -126,7 +130,11 @@ const VIDEO_PUBLIC_PREFIX = '/videos';
 // or duration constants here.
 // ---------------------------------------------------------------------
 const MINIMAX_VIDEO_URL = 'https://api.minimax.io/v1/video_generation';
-const DEFAULT_VIDGEN_MODEL = 'MiniMax-Hailuo-2.3';
+// Model name per the MiniMax docs the user pasted: only
+// "MiniMax-Hailuo-02" and "S2V-01" are accepted values for
+// /v1/video_generation. The previous default ("MiniMax-Hailuo-2.3")
+// was not in the documented model set.
+const DEFAULT_VIDGEN_MODEL = 'MiniMax-Hailuo-02';
 const DEFAULT_VIDGEN_DURATION = 6;
 const DEFAULT_VIDGEN_RESOLUTION = '768P';
 const VIDEO_CALLBACK_PATH = '/api/video-callback';
@@ -773,74 +781,166 @@ function buildVideoPrompt(variant, nicheProfile, category) {
  * works as-is.
  */
 async function submitMinimaxVideoTask(variant, profile, category, firstFrameImageUrl, callbackUrl, signal) {
-  const apiKey = process.env.MINIMAX_API_KEY;
+  // Delegate to the shared MiniMax client (api/minimax_api.js) so the
+  // URL/header plumbing and the base_resp-first error handling
+  // live in one place. The local wrapper keeps the existing call
+  // site (submitMinimaxVideoTasks) unchanged.
   const model = process.env.VIDGEN_MODEL || DEFAULT_VIDGEN_MODEL;
   const duration = Number.isInteger(parseInt(process.env.VIDGEN_DURATION, 10))
     ? parseInt(process.env.VIDGEN_DURATION, 10)
     : DEFAULT_VIDGEN_DURATION;
   const resolution = process.env.VIDGEN_RESOLUTION || DEFAULT_VIDGEN_RESOLUTION;
-
   const prompt = buildVideoPrompt(variant, profile, category);
-  const body = {
-    model,
+
+  const { taskId } = await submitVideoTask({
     prompt,
+    model,
     duration,
     resolution,
-    callback_url: callbackUrl,
-  };
-  if (firstFrameImageUrl) {
-    body.first_frame_image = firstFrameImageUrl;
-  }
-  const response = await fetch(MINIMAX_VIDEO_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(body),
+    callbackUrl,
+    firstFrameImageUrl,
     signal,
   });
-  if (!response.ok) {
-    const errBody = await response.text().catch(() => '<unreadable>');
-    throw new Error(`Video API responded ${response.status}: ${errBody.slice(0, 300)}`);
+  return taskId;
+}
+
+/**
+ * After the variants are submitted to MiniMax, spin up a server-side
+ * polling loop for each one. When a task reaches `Success` we:
+ *   1. Pull the video bytes from MiniMax's download URL
+ *      (`/v1/files/retrieve`).
+ *   2. Upload them to Cloudflare R2 so the bytes survive a server
+ *      restart and are served from a fast edge location. (When
+ *      R2 isn't configured, we keep the MiniMax download URL in
+ *      the in-memory store — the user's browser can still stream
+ *      it from there.)
+ *   3. Write the resolved URL to the in-memory video task store
+ *      so the frontend's existing `/api/video-status` polling
+ *      sees it on the next tick.
+ *   4. On every resolution (success or failure), update the
+ *      daily content store's `videos` entry so the frontend can
+ *      re-fetch the whole day's video list in one call.
+ *
+ * Returns immediately; the polling runs in the background. Each
+ * poll uses its own AbortController so a server shutdown cancels
+ * cleanly (the in-flight fetches abort, the partial set in the
+ * task store stays as-is — better than leaving the operator
+ * with a phantom "processing" entry).
+ */
+function startVideoCompletionHandlers({ submitted, nicheId, dateKey, category, duration }) {
+  // Track how many of the submitted tasks have settled, so we know
+  // when to write the full set to the daily content store.
+  let resolved = 0;
+  const resolvedList = new Array(submitted.length);
+
+  for (let i = 0; i < submitted.length; i++) {
+    const task = submitted[i];
+    const ac = new AbortController();
+    pollVideoTask({
+      taskId: task.taskId,
+      signal: ac.signal,
+      onSuccess: async ({ fileId, downloadUrl }) => {
+        // 1 + 2. Try to offload the bytes to R2. Best-effort —
+        // if R2 is unconfigured or the upload fails, we fall back
+        // to the MiniMax download URL so the user still gets a
+        // playable video. Either way, the URL the frontend sees
+        // is a direct HTTPS link to the bytes.
+        let publicUrl = downloadUrl;
+        if (r2Configured()) {
+          try {
+            const res = await fetch(downloadUrl, { signal: ac.signal });
+            if (!res.ok) throw new Error(`MiniMax download responded ${res.status}`);
+            // Stream into a Buffer — the bytes are bounded
+            // (~2 MB per 6s clip per the user's measurement) so
+            // a 3-clip day is well under 10 MB on the heap.
+            const bytes = Buffer.from(await res.arrayBuffer());
+            const key = `videos/${dateKey}/${nicheId}/${task.taskId}.mp4`;
+            const r2Url = await r2PutObject({ key, body: bytes, contentType: 'video/mp4' });
+            if (r2Url) publicUrl = r2Url;
+            else console.warn(`[r2] video ${task.taskId}: upload returned no URL, using MiniMax URL`);
+          } catch (err) {
+            console.error(`[r2] video ${task.taskId} upload failed: ${err.message}`);
+            // Fall through to the MiniMax URL.
+          }
+        }
+
+        // 3. Hot-store the resolved URL.
+        setVideoTask(task.taskId, {
+          status: 'success',
+          url: publicUrl,
+          fileId,
+          error: null,
+        });
+        resolvedList[i] = { taskId: task.taskId, url: publicUrl, title: task.title, year: task.year };
+        resolved++;
+        if (resolved === submitted.length) {
+          await persistDailyVideos(nicheId, dateKey, category, resolvedList);
+        }
+      },
+      onFailure: ({ error }) => {
+        setVideoTask(task.taskId, {
+          status: 'failed',
+          url: null,
+          fileId: null,
+          error: error || 'MiniMax reported task failure.',
+        });
+        resolvedList[i] = { taskId: task.taskId, url: null, title: task.title, year: task.year, error: error || 'failed' };
+        resolved++;
+        if (resolved === submitted.length) {
+          persistDailyVideos(nicheId, dateKey, category, resolvedList).catch(() => {});
+        }
+      },
+      onTimeout: () => {
+        setVideoTask(task.taskId, {
+          status: 'failed',
+          url: null,
+          fileId: null,
+          error: 'Polling timeout (6 min) — MiniMax did not return a result.',
+        });
+        resolvedList[i] = { taskId: task.taskId, url: null, title: task.title, year: task.year, error: 'timeout' };
+        resolved++;
+        if (resolved === submitted.length) {
+          persistDailyVideos(nicheId, dateKey, category, resolvedList).catch(() => {});
+        }
+      },
+      onTick: ({ status }) => {
+        if (status !== 'processing') {
+          console.log(`[videos][poll] ${task.taskId} → ${status}`);
+        }
+      },
+    }).catch((err) => {
+      // pollVideoTask catches its own errors; this is the outer
+      // safety net for the rare case where the helper itself
+      // throws (e.g., signal handling).
+      console.error(`[videos][poll] ${task.taskId} crashed: ${err.message}`);
+    });
   }
-  const data = await response.json();
-  // Documented response shape: { task_id, base_resp: { status_code, status_msg } }
-  //
-  // Check `base_resp.status_code` FIRST so a rejected submission
-  // surfaces the actual reason ("invalid params", "auth failed",
-  // "callback url unreachable", etc.) instead of a misleading
-  // "missing task_id" — when MiniMax rejects a submission it
-  // returns `task_id: ""`, which would otherwise be the only
-  // signal the caller sees. Order matters: never let the empty-
-  // task_id check mask a more informative error.
-  const code = data?.base_resp?.status_code;
-  if (typeof code === 'number' && code !== 0) {
-    const statusMsg = data?.base_resp?.status_msg;
-    throw new Error(
-      `Video API rejected task (code ${code}` +
-      (statusMsg ? `: ${statusMsg}` : '') +
-      `)`
-    );
-  }
-  if (typeof data?.task_id !== 'string' || data.task_id.length === 0) {
-    throw new Error('Video API response missing task_id.');
-  }
-  return data.task_id;
+}
+
+/**
+ * Persist the resolved video set to the daily content store. We
+ * write the FULL set on every resolution (not just on the last)
+ * so a partial day is still browseable via /api/daily-content.
+ * The last write wins because the store is keyed by dateKey.
+ */
+async function persistDailyVideos(nicheId, dateKey, category, resolvedList) {
+  // Drop null/errored entries from the user-facing list.
+  const playable = resolvedList
+    .filter((v) => v && v.url)
+    .map((v) => ({ url: v.url, title: v.title || '', year: v.year || '' }));
+  await setDailyContent('videos', nicheId, {
+    dateKey,
+    niche: nicheId,
+    category,
+    generatedAt: new Date().toISOString(),
+    videos: playable,
+  });
 }
 
 /**
  * Submit every variant to MiniMax in parallel. Returns an array of
  * `{ taskId, title, hook, script, year }` for the variants whose
- * submission succeeded — failed submissions are logged and skipped
- * (the frontend will render one fewer card).
- *
- * `firstFrames` is optional and must be aligned by index with
- * `variants`. Pass `null` (or omit the entry) for T2V; pass the
- * data URL string for I2V.
- *
- * Uses bounded concurrency (`mapWithConcurrency`) so we don't blow
- * past the MiniMax gateway's per-key rate limit.
+ * submission succeeded — failed submissions are logged and skipped.
  */
 async function submitMinimaxVideoTasks(variants, profile, year, category, firstFrames, callbackUrl, signal) {
   const submitted = [];
@@ -1198,6 +1298,11 @@ export const POST = withCors(async (request, ctx) => {
       }).catch(() => {});
       const statusUrl = `${VIDEO_STATUS_PATH}?ids=${submitted.map((t) => t.taskId).join(',')}`;
       console.log(`[videos][step4-t2v] submitted ${submitted.length}/${variants.length} tasks; statusUrl=${statusUrl}`);
+      // Start server-side polling so the videos complete even when
+      // the callback URL isn't reachable from MiniMax's network.
+      startVideoCompletionHandlers({
+        submitted, nicheId: profile.id, dateKey, category, duration: t2vDuration,
+      });
       // 202 Accepted — the work continues asynchronously, frontend
       // polls statusUrl for completion.
       return jsonResponse(
@@ -1277,6 +1382,11 @@ export const POST = withCors(async (request, ctx) => {
       }).catch(() => {});
       const statusUrl = `${VIDEO_STATUS_PATH}?ids=${submitted.map((t) => t.taskId).join(',')}`;
       console.log(`[videos][step4-i2v] submitted ${submitted.length}/${validPairs.length} tasks; statusUrl=${statusUrl}`);
+      // Start server-side polling so the videos complete even when
+      // the callback URL isn't reachable from MiniMax's network.
+      startVideoCompletionHandlers({
+        submitted, nicheId: profile.id, dateKey, category, duration: i2vDuration,
+      });
       return jsonResponse(
         {
           status: 'processing',

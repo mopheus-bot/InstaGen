@@ -65,6 +65,50 @@
 
       <section class="totals" aria-label="Running totals">
         <header class="totals-head">
+          <h2 class="section-title">This week</h2>
+          <span class="totals-date">
+            <span id="weekRange">—</span>
+            <span class="totals-resets">resets in <span id="weekResetsIn">—</span></span>
+          </span>
+        </header>
+        <div class="totals-grid">
+          <article class="card stat" data-stat="week-events">
+            <span class="stat-label">Calls this week</span>
+            <span class="stat-value" id="statWeekEvents">—</span>
+          </article>
+          <article class="card stat" data-stat="week-text">
+            <span class="stat-label">Text tokens</span>
+            <span class="stat-value" id="statWeekTokens">—</span>
+            <span class="stat-sub" id="statWeekTokensSub"></span>
+          </article>
+          <article class="card stat" data-stat="week-img">
+            <span class="stat-label">Images</span>
+            <span class="stat-value" id="statWeekImages">—</span>
+          </article>
+          <article class="card stat" data-stat="week-vid">
+            <span class="stat-label">Video</span>
+            <span class="stat-value" id="statWeekVideos">—</span>
+            <span class="stat-sub" id="statWeekVideoSub"></span>
+          </article>
+          <article class="card stat stat-cost" data-stat="week-usd">
+            <span class="stat-label">Week cost</span>
+            <span class="stat-value" id="statWeekUsd">—</span>
+          </article>
+        </div>
+        <div class="week-cap" aria-label="Weekly cap usage">
+          <div class="week-cap-head">
+            <span class="week-cap-label">Weekly cap</span>
+            <span class="week-cap-pct" id="weekCapPct">0%</span>
+          </div>
+          <div class="week-cap-track">
+            <div class="week-cap-bar" id="weekCapBar" style="width: 0%"></div>
+          </div>
+          <div class="week-cap-detail" id="weekCapDetail">—</div>
+        </div>
+      </section>
+
+      <section class="totals" aria-label="Running totals">
+        <header class="totals-head">
           <h2 class="section-title">Since restart</h2>
         </header>
         <div class="totals-grid">

@@ -48,6 +48,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { gateMiddleware, handleAuthPost, handleAuthLogout } from './api/_gate.js';
 import { startVideoTaskSweeper } from './api/video_task_store.js';
+import { startDailyFlusher } from './api/daily_content_store.js';
 
 // ---------------------------------------------------------------------
 // Dynamic CORS — same allowlist rules as api/_request.js
@@ -223,6 +224,7 @@ const apiHandlers = {
   'generate-daily-videos':  (await import('./api/generate-daily-videos.js')),
   'video-callback':         (await import('./api/video-callback.js')),
   'video-status':           (await import('./api/video-status.js')),
+  'daily-content':          (await import('./api/daily_content.js')),
   // Admin routes live under /api/admin/* — mount with the literal
   // 'admin/usage' slug so mountApiRoute puts the GET and POST on
   // the same path the admin dashboard fetches. Sub-actions
@@ -385,6 +387,24 @@ const sweeper = startVideoTaskSweeper();
 console.log(
   `[instagen] video-task GC armed: ttl=${sweeper.ttlMs}ms ` +
   `step=${sweeper.stepMs}ms`
+);
+
+// Start the daily-content flusher — drops in-memory entries whose
+// dateKey != today on the next local midnight, with a 15-min
+// safety-net sweep in case the server was restarted across the
+// boundary. Cloudflare KV (when configured) auto-expires entries
+// via the per-write TTL of "seconds until next midnight".
+const dailyFlusher = startDailyFlusher();
+console.log(
+  `[instagen] daily-content flusher armed: safety=${dailyFlusher.safetyMs}ms`
+);
+// Log which backing layer is in use so an operator can see at a
+// glance whether Cloudflare KV is wired up.
+const { kvConfigured } = await import('./api/cf_kv.js');
+console.log(
+  kvConfigured()
+    ? '[instagen] daily-content backing: Cloudflare KV + memory'
+    : '[instagen] daily-content backing: memory only (CF_API_TOKEN/CF_ACCOUNT_ID/CF_KV_NAMESPACE_ID not set)'
 );
 
 const PORT = Number(process.env.PORT) || 3000;

@@ -631,6 +631,62 @@
       }
 
       /* ----------------------------------------------------------------- */
+      /* Back-to-content pill (Safari-style download return)                */
+      /* ----------------------------------------------------------------- */
+      /* Floats over the bottom of the viewport after a download fires,
+         with a smooth fade+rise entrance. Tap → smooth scroll to the
+         section the user came from. Auto-dismisses after 6s. */
+      .back-to-content-pill {
+        position: fixed;
+        left: 50%;
+        bottom: calc(env(safe-area-inset-bottom, 0px) + 24px);
+        transform: translate(-50%, 12px);
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 16px;
+        background: rgba(20, 20, 22, 0.92);
+        color: #fff;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 999px;
+        font: inherit;
+        font-size: 13px;
+        font-weight: 500;
+        letter-spacing: 0.01em;
+        cursor: pointer;
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 220ms ease, transform 220ms ease;
+        z-index: 50;
+      }
+      .back-to-content-pill.visible {
+        opacity: 1;
+        transform: translate(-50%, 0);
+        pointer-events: auto;
+      }
+      .back-to-content-pill:hover {
+        background: rgba(35, 35, 38, 0.95);
+        border-color: rgba(255, 255, 255, 0.28);
+      }
+      .back-to-content-pill:active {
+        transform: translate(-50%, 1px) scale(0.98);
+      }
+      .back-to-content-pill svg {
+        width: 16px;
+        height: 16px;
+        stroke: currentColor;
+      }
+      /* The default arrow points UP (back to the carousel). When the
+         pill is shown for video downloads it flips DOWN (back to the
+         video grid below). */
+      .back-to-content-pill.to-videos svg {
+        transform: rotate(180deg);
+      }
+
+      /* ----------------------------------------------------------------- */
       /* Utility                                                             */
       /* ----------------------------------------------------------------- */
       [hidden] {

@@ -21,12 +21,20 @@ import {
   getNiche,
 } from './state.js';
 import { apiUrl } from './api-base.js';
+import { cacheGet, cachePut } from './cache-store.js';
+import {
+  loadMedia as loadMediaFromCache,
+  saveMedia as saveMediaToCache,
+  fetchAndCacheMedia,
+  mediaBlobUrl,
+} from './media-cache.js';
 
 // API base defaults to same-origin ("/api/..."). Override via
 // window.INSTAGEN_API_BASE or <meta name="instagen-api-base"> for
 // split-architecture deploys (see public/api-base.js).
 const API_ENDPOINT = apiUrl('/api/generate-content');
 const VIDEO_API_ENDPOINT = apiUrl('/api/generate-daily-videos');
+const DAILY_CONTENT_ENDPOINT = apiUrl('/api/daily-content');
 
 // Cache is keyed by (niche, date) so picking a different niche on the
 // hub doesn't show another niche's cached carousel. The legacy single-key
@@ -133,24 +141,83 @@ function getPrettyToday() {
  * once a new day starts, and entries for a different niche are not
  * returned (so switching from True Crime to History on the hub gives
  * a fresh History carousel, not yesterday's True Crime one).
+ *
+ * Backed by IndexedDB (see public/cache-store.js) — localStorage
+ * has a 5 MB per-origin cap that the carousel's 8 base64 images
+ * blow past, which made the cache silently fail on Safari. The
+ * async wrapper around what was previously a sync read means
+ * `loadFromCache` is now awaited at the call site, not used
+ * inline.
  */
-function loadFromCache() {
-  const cacheKey = getCacheKey();
+async function loadFromCache() {
+  // The browser no longer caches the carousel payload itself —
+  // the server is the single source of truth. The fetch returns
+  // 404 if there's no content for today, in which case the
+  // frontend shows the Generate button. A 200 response carries
+  // the same `{ slides, generatedAt, ... }` shape the carousel
+  // handler used to return directly.
+  const url = `${DAILY_CONTENT_ENDPOINT}?type=carousel&niche=${encodeURIComponent(getNiche(activeNiche).id)}`;
   try {
-    const raw = localStorage.getItem(cacheKey);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (parsed?.dateKey !== getTodayKey()) return null;
-    if (!Array.isArray(parsed?.slides) || parsed.slides.length === 0) return null;
-    return parsed;
+    const res = await fetch(url, { credentials: 'same-origin' });
+    if (res.status === 404) return null;
+    if (res.status === 410) return null;
+    if (!res.ok) throw new Error(`daily-content ${res.status}`);
+    const body = await res.json();
+    if (!body?.payload) return null;
+    if (!Array.isArray(body.payload.slides) || body.payload.slides.length === 0) return null;
+    return body.payload;
   } catch (err) {
-    console.warn('[cache] failed to read:', err);
+    console.warn('[cache] server fetch failed:', err);
     return null;
   }
 }
 
-/** Persists the payload under the active niche + today's key, with a timestamp. */
-function saveToCache(payload) {
+/**
+ * Resolve the best `src` for a slide's image. The server gives us
+ * an R2 URL (or a data: URL fallback if R2 is unconfigured). We:
+ *   1. Check the IndexedDB blob cache for a previously-fetched
+ *      copy of the same URL → use a `blob:` URL (zero R2 bandwidth).
+ *   2. Miss → use the R2 URL directly. The onload hook fetches
+ *      the bytes in the background, stores them in IDB for next
+ *      time, and re-renders the same <img> with a `blob:` URL
+ *      (seamless — the user doesn't see anything different).
+ */
+async function resolveImageSrc(imageUrl) {
+  if (!imageUrl) return '';
+  // Always allow the synchronous data: URL path (e.g., when R2
+  // is unconfigured and the server returned inline base64). Don't
+  // try to cache a data: URL — it's already in the response.
+  if (imageUrl.startsWith('data:')) return imageUrl;
+  const cached = await loadMediaFromCache(imageUrl);
+  if (cached && cached.blob) {
+    return URL.createObjectURL(cached.blob);
+  }
+  return imageUrl;   // direct R2 fetch on first visit
+}
+
+/**
+ * Pre-fetch + cache the image bytes in the background after the
+ * <img> has loaded. The image already rendered from the R2 URL;
+ * the user doesn't see anything change. Subsequent visits use
+ * the cached blob.
+ */
+function warmImageCache(imageUrl) {
+  if (!imageUrl) return;
+  if (imageUrl.startsWith('data:')) return;
+  if (imageUrl.startsWith('blob:')) return;
+  loadMediaFromCache(imageUrl).then((cached) => {
+    if (cached) return;   // already warm
+    return fetchAndCacheMedia(imageUrl).catch(() => null);
+  }).catch(() => null);
+}
+
+/**
+ * Persists the payload under the active niche + today's key, with a
+ * timestamp. Best-effort: if the write fails (quota, private mode)
+ * we log and continue — the next page load will just hit the
+ * network again.
+ */
+async function saveToCache(payload) {
   try {
     const record = {
       ...payload,
@@ -158,7 +225,7 @@ function saveToCache(payload) {
       niche: getNiche(activeNiche).id,
       cachedAt: new Date().toISOString(),
     };
-    localStorage.setItem(getCacheKey(), JSON.stringify(record));
+    await cachePut(getCacheKey(), record);
   } catch (err) {
     console.warn('[cache] failed to write:', err);
   }
@@ -498,7 +565,7 @@ function timeAgo(iso) {
  * Renders one slide card. Returns the root element so we can attach
  * per-image load handlers for the fade-in transition.
  */
-function renderSlide(slide, index) {
+async function renderSlide(slide, index) {
   const card = document.createElement('article');
   card.className = 'slide';
   card.style.animationDelay = `${index * 40}ms`;
@@ -512,8 +579,16 @@ function renderSlide(slide, index) {
   img.alt = slide.title || 'Historical image';
   img.loading = 'lazy';
   img.decoding = 'async';
-  img.src = slide.imageUrl;
-  img.addEventListener('load', () => img.classList.add('loaded'));
+  // Source resolution: cached blob → R2 URL → data: URL fallback.
+  // Async because the IndexedDB lookup is async.
+  img.src = await resolveImageSrc(slide.imageUrl);
+  img.addEventListener('load', () => {
+    img.classList.add('loaded');
+    // Pre-warm the IDB cache on the first successful load so the
+    // next render is served from disk. No-op if the image is a
+    // data: URL (no point caching what's already in the payload).
+    warmImageCache(slide.imageUrl);
+  });
   img.addEventListener('error', () => img.classList.add('loaded')); // still fade in
 
   const year = document.createElement('span');
@@ -621,11 +696,17 @@ async function copyToClipboard(button, text) {
 }
 
 /** Mounts the slide array into the grid. */
-function renderSlides(payload) {
+async function renderSlides(payload) {
   els.slideGrid.innerHTML = '';
-  payload.slides.forEach((slide, i) => {
-    els.slideGrid.appendChild(renderSlide(slide, i));
-  });
+  // renderSlide is now async (the image src depends on an IDB
+  // lookup). Resolve them in parallel — each slide's image src is
+  // independent — then mount the cards. The grid is empty for
+  // the first few ms of the await, which is fine because the
+  // cards are appended to the same fragment before the next paint.
+  const cards = await Promise.all(
+    payload.slides.map((slide, i) => renderSlide(slide, i))
+  );
+  cards.forEach((card) => els.slideGrid.appendChild(card));
 
   // Meta line: "8 slides · just now" (or "8 slides · 2h ago" if cached)
   const slideCount = payload.slides.length;
@@ -697,6 +778,7 @@ async function downloadImage(slide, index) {
     slide.title || `event-${index + 1}`
   )}.jpg`;
 
+  let downloaded = false;
   try {
     // Best path: fetch → blob → object URL → <a download>.
     // Works on desktop and modern Android browsers.
@@ -707,16 +789,25 @@ async function downloadImage(slide, index) {
       triggerDownload(blobUrl, safeName);
       // Revoke after a tick so the browser has time to start the download.
       setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
-      return;
+      downloaded = true;
     }
   } catch {
     /* fall through to direct-anchor path */
   }
 
-  // Fallback: open the URL in a new tab. Mobile users can long-press
-  // to save; desktop users get a normal download via Content-Disposition
-  // if the host set one, or a right-click → Save As otherwise.
-  triggerDownload(slide.imageUrl, safeName, /* newTab = */ true);
+  if (!downloaded) {
+    // Fallback: open the URL in a new tab. Mobile users can long-press
+    // to save; desktop users get a normal download via Content-Disposition
+    // if the host set one, or a right-click → Save As otherwise.
+    triggerDownload(slide.imageUrl, safeName, /* newTab = */ true);
+  }
+
+  // Show the Safari-style "back to content" pill. The image anchor
+  // download doesn't navigate the page, but mobile browsers may
+  // pop a confirmation overlay (Save to Photos, etc.) that hides
+  // the carousel — the pill lets the user return without
+  // scrolling back manually.
+  showBackToContentPill('carousel');
 }
 
 function triggerDownload(href, filename, newTab = false) {
@@ -728,6 +819,59 @@ function triggerDownload(href, filename, newTab = false) {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
+}
+
+// ---------------------------------------------------------------------
+// "Back to content" pill — Safari-style affordance after a download
+// ---------------------------------------------------------------------
+// Both the slide and video download paths leave the user on the
+// same page, but on mobile the browser can overlay a download
+// confirmation or video preview that hides the carousel/grid. The
+// pill surfaces a one-tap return to whichever section the user
+// came from, with no page reload — just a smooth scroll.
+//
+// `target` is one of: 'carousel' (slide grid) or 'videos' (video grid).
+
+let backPillTimer = null;
+let backPillEl = null;
+function showBackToContentPill(target) {
+  // Reuse the same DOM node if it's already mounted (subsequent
+  // downloads don't pile up pills).
+  if (!backPillEl) {
+    backPillEl = document.createElement('button');
+    backPillEl.type = 'button';
+    backPillEl.className = 'back-to-content-pill';
+    backPillEl.setAttribute('aria-label', 'Back to content');
+    backPillEl.innerHTML = `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 19V5M5 12l7-7 7 7"></path>
+      </svg>
+      <span>Back to content</span>
+    `;
+    backPillEl.addEventListener('click', () => {
+      dismissBackPill();
+      const el = target === 'videos' ? els.videos : els.results;
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+    document.body.appendChild(backPillEl);
+  }
+  // The arrow icon flips depending on which section we're
+  // returning to (down-arrow for videos, up-arrow for carousel).
+  backPillEl.classList.toggle('to-videos', target === 'videos');
+  // Force reflow so the re-show animation re-fires.
+  backPillEl.classList.remove('visible');
+  void backPillEl.offsetWidth;
+  backPillEl.classList.add('visible');
+
+  // Auto-dismiss after 6s. Subsequent calls reset the timer.
+  clearTimeout(backPillTimer);
+  backPillTimer = setTimeout(dismissBackPill, 6000);
+}
+function dismissBackPill() {
+  clearTimeout(backPillTimer);
+  backPillTimer = null;
+  if (backPillEl) backPillEl.classList.remove('visible');
 }
 
 function slugify(s) {
@@ -795,6 +939,12 @@ function renderVideoCard(video, index) {
     </svg>
     <span>Download</span>
   `;
+  // Same Safari-style back-to-content affordance as the image
+  // download. target=_blank opens a new tab for the video file;
+  // the user is still on the generator page but the tab focus
+  // shift can make the carousel feel "lost" — the pill anchors
+  // their return.
+  dl.addEventListener('click', () => showBackToContentPill('videos'));
 
   actions.append(dl);
 
@@ -831,6 +981,10 @@ async function handleGenerateClick() {
 
   try {
     const payload = await requestGeneration();
+    // Fire-and-forget the cache write so a slow IDB transaction
+    // doesn't delay the first paint of the new carousel. The
+    // `await` in `saveToCache` is still there in case we want to
+    // surface a failure later; for now we don't block.
     saveToCache(payload);
     renderSlides(payload);
   } catch (err) {
@@ -945,12 +1099,15 @@ function init() {
 
   // Instant-load from cache if we already have today's carousel for
   // the active niche. (Different niche → different cache key → cache
-  // miss → user clicks Generate.)
-  const cached = loadFromCache();
-  if (cached) {
-    console.info('[cache] rendering cached carousel for', cached.dateKey, '·', getNiche(activeNiche).id);
-    renderSlides(cached);
-  }
+  // miss → user clicks Generate.) Async because the cache store is
+  // now backed by IndexedDB.
+  loadFromCache()
+    .then((cached) => {
+      if (!cached) return;
+      console.info('[cache] rendering cached carousel for', cached.dateKey, '·', getNiche(activeNiche).id);
+      renderSlides(cached);
+    })
+    .catch((err) => console.warn('[cache] init load failed:', err));
 }
 
 // Fire init once the DOM is parsed (this script is <script type="module">
