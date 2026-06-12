@@ -16,22 +16,20 @@
 //           "status":  "processing" | "success" | "failed",
 //           "file_id": "...",          // on success
 //           "base_resp": { status_code, status_msg } }
-//       We persist the snapshot into video_task_store so the
+//       We reverse-lookup the LOCAL jobId (primary key in our store)
+//       by the MiniMax taskId and persist the snapshot there so the
 //       frontend's poll of /api/video-status can pick it up.
 //
 // Route:  POST /api/video-callback
 // Env:    (none — the store is in-process)
 // =====================================================================
 
-import { setVideoTask } from './video_task_store.js';
-import { withCors, getClientIp } from './_request.js';
-
-function jsonResponse(body, status = 200, extraHeaders = {}) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json', ...extraHeaders },
-  });
-}
+import {
+  setVideoTask,
+  getVideoTaskByMinimaxId,
+} from './video_task_store.js';
+import { withCors } from './_request.js';
+import { jsonResponse } from './_helpers.js';
 
 export const GET = withCors(async () => {
   return jsonResponse(
@@ -76,32 +74,47 @@ export const POST = withCors(async (request, ctx) => {
   // ignore anything we don't recognize (a future MiniMax status
   // string would still be persisted verbatim so the frontend can
   // surface it).
-  const taskId = body.task_id;
-  if (typeof taskId !== 'string' || taskId.length === 0) {
+  const minimaxTaskId = body.task_id;
+  if (typeof minimaxTaskId !== 'string' || minimaxTaskId.length === 0) {
     return jsonResponse({ error: 'Missing task_id.' }, 400);
   }
 
+  // Reverse-lookup the LOCAL jobId by the MiniMax taskId. The
+  // store is keyed by jobId (returned to the client in the 202),
+  // so a callback for a task we've never seen — or one that was
+  // GC'd — is a no-op rather than a 404. The 200 keeps MiniMax
+  // from retrying.
+  const existing = getVideoTaskByMinimaxId(minimaxTaskId);
+  if (!existing) {
+    // Not necessarily an error: the submit may have failed before
+    // we could record the minimaxTaskId, or the record may have
+    // aged out. Ack so MiniMax stops retrying.
+    return jsonResponse({ status: 'unknown-task', minimaxTaskId });
+  }
+
   const statusRaw = typeof body.status === 'string' ? body.status : 'unknown';
+  // 'submitting' is the fire-and-forget local state; the callback
+  // can only move it forward to 'processing' / 'success' / 'failed'.
   const normalized = ['processing', 'success', 'failed'].includes(statusRaw)
     ? statusRaw
-    : statusRaw; // pass through unknown values so the frontend can show them
+    : 'processing';
 
   const fileId = typeof body.file_id === 'string' ? body.file_id : null;
   const baseResp = (body.base_resp && typeof body.base_resp === 'object')
     ? body.base_resp
     : null;
 
-  setVideoTask(taskId, {
+  setVideoTask(existing.jobId, {
     status: normalized,
     fileId,
     // MiniMax's success payload may include a hosted URL under
     // various field names. Capture any of them so the frontend
     // doesn't need a follow-up call.
-    url: body.url || body.video_url || body.download_url || null,
+    url: body.url || body.video_url || body.download_url || existing.url || null,
     error: normalized === 'failed'
       ? (baseResp?.status_msg || 'MiniMax reported task failure.')
       : null,
   });
 
-  return jsonResponse({ status: 'received' });
+  return jsonResponse({ status: 'received', jobId: existing.jobId });
 });

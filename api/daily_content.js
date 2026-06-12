@@ -21,16 +21,10 @@
 //           happen with the KV TTL, but defensive)
 // =====================================================================
 
-import { withCors, getClientIp } from './_request.js';
+import { withCors } from './_request.js';
 import { getDailyContent } from './daily_content_store.js';
 import { _internal as storeInternal } from './daily_content_store.js';
-
-function jsonResponse(body, status = 200, extraHeaders = {}) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json', ...extraHeaders },
-  });
-}
+import { jsonResponse } from './_helpers.js';
 
 export const GET = withCors(async (request) => {
   const url = new URL(request.url);

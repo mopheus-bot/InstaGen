@@ -280,21 +280,24 @@ async function requestGeneration() {
  *   - ASYNC (HTTP 202): { status: 'processing', tasks: [...],
  *                          statusUrl: '/api/video-status?ids=...' }
  *     — the backend accepted the work and MiniMax is rendering
- *     asynchronously. Frontend polls statusUrl until each task
- *     resolves, then renders the completed videos. The status
- *     field is normalized by the handler to 'processing' on
- *     submit and 'completed'/'failed' on the per-task callback.
+ *     asynchronously. Each task in the response carries a LOCAL
+ *     `jobId` (UUID) that the frontend uses to poll for status
+ *     and to render the final URL once the R2 upload finishes.
+ *     The status endpoint normalizes status to 'submitting'
+ *     before the upstream submit lands, 'processing' once the
+ *     task is accepted by MiniMax, and 'success' / 'failed' on
+ *     the per-task callback (or polling tick).
  *
  * Returns a tagged union: { kind: 'sync', videos, generatedAt }
  * or { kind: 'async', tasks, statusUrl, generatedAt }.
  */
 async function submitVideoGeneration() {
-  // Frontend timeout: 60 s. The I2V handler returns 202 after
-  // submission (typically 30–45 s), so 60 s is a comfortable
-  // ceiling. If the request hangs longer (e.g., Cloudflare's
-  // free-tier 100 s upstream timeout fires BEFORE our handler
-  // returns and the browser sees a non-JSON 502), we abort
-  // cleanly and surface a useful error.
+  // Frontend timeout: 60 s. The handler returns 202 after the
+  // local jobIds are pre-allocated and the upstream submit is
+  // kicked off in the background (sub-2ms Node CPU time on the
+  // request path). The 60 s ceiling is still a useful safety net
+  // in case a slow deployment host blocks the 202 from going
+  // out (e.g., a network blip on the Cloudflare edge).
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), 60_000);
   let response;
@@ -407,8 +410,13 @@ async function pollVideoStatus(statusUrl, tasks, onUpdate, opts = {}) {
     const completed = [];
     let stillRunning = 0;
     for (const t of tasks) {
-      const r = data?.tasks?.[t.taskId];
-      if (!r || r.status === 'processing' || r.status === 'unknown') {
+      // The 202 response uses the LOCAL jobId (the id the client
+      // sees); the status endpoint indexes records by the same id.
+      // Older code referenced `t.taskId`, which was the upstream
+      // MiniMax taskId — that's now an internal detail.
+      const id = t.jobId || t.taskId;
+      const r = data?.tasks?.[id];
+      if (!r || r.status === 'submitting' || r.status === 'processing' || r.status === 'unknown') {
         stillRunning++;
         continue;
       }
@@ -419,7 +427,7 @@ async function pollVideoStatus(statusUrl, tasks, onUpdate, opts = {}) {
       //                             total count, so the user sees
       //                             fewer videos).
       if ((r.status === 'success' || r.status === 'completed') && r.url) {
-        completed.push({ url: r.url, title: t.title || '', year: t.year || '' });
+        completed.push({ url: r.url, title: r.title || t.title || '', year: r.year || t.year || '' });
       }
     }
 

@@ -24,44 +24,53 @@
 // The cost is that records are lost on restart and cannot span
 // replicas; the reward is zero idle cost on a $4 VPS.
 //
-// Stored record shape (per task_id):
+// Record shape (keyed by the local `jobId` returned to the client):
 //   {
-//     status     : 'processing' | 'success' | 'failed' | 'unknown',
-//     url        : string | null,   // hosted video URL on success
-//     fileId     : string | null,   // MiniMax file_id on success
-//     error      : string | null,   // failure reason on failed
-//     updatedAt  : ISO timestamp,
-//     timestamp  : number           // Date.now() epoch ms, used by
-//                                  // the GC sweep to find stale
-//                                  // entries without parsing the
-//                                  // ISO string on every record
+//     jobId          : string,           // primary key, local UUID
+//     status         : 'submitting'      // fire-and-forget submit
+//                  |     | 'processing'   // accepted by MiniMax
+//                  |     | 'success'      // R2 URL ready
+//                  |     | 'failed'       // any failure path
+//     url            : string | null,    // R2 (or MiniMax) URL on success
+//     fileId         : string | null,    // MiniMax file_id on success
+//     error          : string | null,    // failure reason on failed
+//     minimaxTaskId  : string | null,    // MiniMax task_id, set once
+//                                       // the upstream submit settles
+//     title          : string,           // variant title (echoed back)
+//     year           : string,           // variant year  (echoed back)
+//     updatedAt      : ISO timestamp,
+//     timestamp      : number            // Date.now() epoch ms
 //   }
 // =====================================================================
 
 const store = new Map();
 
 /**
- * Merge `partial` into the record stored under `taskId`, creating
+ * Merge `partial` into the record stored under `jobId`, creating
  * the record if it does not exist. Always stamps `updatedAt` (ISO)
  * and `timestamp` (epoch ms). The numeric `timestamp` is what the
  * background GC sweep compares against — keeping it as a number
  * avoids parsing an ISO string on every record on every sweep.
  *
- * @param {string} taskId
+ * @param {string} jobId
  * @param {object} partial  Subset of the record shape.
  * @returns {object}        The merged record (post-write snapshot).
  */
-export function setVideoTask(taskId, partial) {
-  if (typeof taskId !== 'string' || taskId.length === 0) {
-    throw new Error('setVideoTask: taskId must be a non-empty string.');
+export function setVideoTask(jobId, partial) {
+  if (typeof jobId !== 'string' || jobId.length === 0) {
+    throw new Error('setVideoTask: jobId must be a non-empty string.');
   }
   const nowIso = new Date().toISOString();
   const nowMs = Date.now();
-  const prev = store.get(taskId) || {
-    status: 'processing',
+  const prev = store.get(jobId) || {
+    jobId,
+    status: 'submitting',
     url: null,
     fileId: null,
     error: null,
+    minimaxTaskId: null,
+    title: '',
+    year: '',
     updatedAt: nowIso,
     timestamp: nowMs,
   };
@@ -71,44 +80,64 @@ export function setVideoTask(taskId, partial) {
     updatedAt: nowIso,
     timestamp: nowMs,
   };
-  store.set(taskId, next);
+  store.set(jobId, next);
   return next;
 }
 
 /**
- * Read a single record. Returns `null` if the id is unknown.
+ * Read a single record by its local jobId. Returns `null` if the id
+ * is unknown.
  *
- * @param {string} taskId
+ * @param {string} jobId
  * @returns {object|null}
  */
-export function getVideoTask(taskId) {
-  return store.has(taskId) ? { ...store.get(taskId) } : null;
+export function getVideoTask(jobId) {
+  return store.has(jobId) ? { ...store.get(jobId) } : null;
 }
 
 /**
  * Read many records in one call. Missing ids come back as `null` so
  * the caller can distinguish "not yet arrived" from "never submitted."
  *
- * @param {string[]} taskIds
- * @returns {object}  { [taskId]: record | null }
+ * @param {string[]} jobIds
+ * @returns {object}  { [jobId]: record | null }
  */
-export function getVideoTasks(taskIds) {
+export function getVideoTasks(jobIds) {
   const out = {};
-  for (const id of taskIds) {
+  for (const id of jobIds) {
     out[id] = store.has(id) ? { ...store.get(id) } : null;
   }
   return out;
 }
 
 /**
+ * Look up a record by its upstream MiniMax taskId. The callback
+ * path (api/video-callback.js) only knows the MiniMax id, but the
+ * primary key in this store is the local jobId — so the callback
+ * does a reverse scan via this helper. O(n) over the Map; fine for
+ * the volume we expect (≤ a few dozen in-flight jobs at a time on
+ * a small deployment).
+ *
+ * @param {string} minimaxTaskId
+ * @returns {object|null}
+ */
+export function getVideoTaskByMinimaxId(minimaxTaskId) {
+  if (typeof minimaxTaskId !== 'string' || minimaxTaskId.length === 0) return null;
+  for (const rec of store.values()) {
+    if (rec && rec.minimaxTaskId === minimaxTaskId) return { ...rec };
+  }
+  return null;
+}
+
+/**
  * Drop a record. Used by cleanup jobs (not currently wired) and by
  * tests.
  *
- * @param {string} taskId
+ * @param {string} jobId
  * @returns {boolean}  true if a record was removed.
  */
-export function deleteVideoTask(taskId) {
-  return store.delete(taskId);
+export function deleteVideoTask(jobId) {
+  return store.delete(jobId);
 }
 
 // ---------------------------------------------------------------------

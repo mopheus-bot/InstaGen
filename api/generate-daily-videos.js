@@ -56,12 +56,23 @@
 // ---------------------------------------------------------------------
 import { resolveNicheProfile } from './niche_profiles.js';
 import { buildNicheQuery } from './niche_queries.js';
-import { withCors, getClientIp, getPublicOrigin } from './_request.js';
+import { withCors, getPublicOrigin } from './_request.js';
 import { recordUsage } from './_usage.js';
 import { setDailyContent } from './daily_content_store.js';
 import { r2PutObject, r2Configured } from './cf_r2.js';
 import { submitVideoTask, pollVideoTask } from './minimax_api.js';
 import { setVideoTask } from './video_task_store.js';
+import {
+  jsonResponse,
+  getDateKey,
+  getPrettyDate,
+  sanitizeLlmOutput,
+  extractLlmText,
+  extractLlmUsage,
+  installUncaughtHandlers,
+  dataUrlToBuffer,
+  generateJobId,
+} from './_helpers.js';
 
 // ---------------------------------------------------------------------
 // Constants
@@ -154,46 +165,10 @@ const CATEGORY_PRESETS = {
 const DEFAULT_CATEGORY = 'reel';
 
 // ---------------------------------------------------------------------
-// Date helpers (server-local timezone)
+// Date helpers (server-local timezone) + LLM output sanitization
 // ---------------------------------------------------------------------
-
-/** YYYY-MM-DD in the server's local timezone. */
-function getDateKey() {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
-
-/** "January 7" style label injected into the system prompts. */
-function getPrettyDate() {
-  return new Date().toLocaleDateString('en-US', {
-    month: 'long',
-    day: 'numeric',
-  });
-}
-
-// ---------------------------------------------------------------------
-// Shared LLM output sanitization
-// ---------------------------------------------------------------------
-
-/**
- * Defensive trim + fence strip. The system prompts tell the model
- * not to emit markdown fences, but the same belt-and-suspenders
- * pattern from api/generate-content.js is reused here so a stray
- * ```json ... ``` is handled without a 502.
- */
-function sanitizeLlmOutput(rawText) {
-  if (typeof rawText !== 'string' || rawText.length === 0) {
-    throw new Error('LLM returned empty or non-string content.');
-  }
-  let cleaned = rawText.trim();
-  if (cleaned.startsWith('```json')) cleaned = cleaned.slice('```json'.length);
-  else if (cleaned.startsWith('```')) cleaned = cleaned.slice(3);
-  if (cleaned.endsWith('```')) cleaned = cleaned.slice(0, -3);
-  return cleaned.trim();
-}
+// Both are imported from api/_helpers.js so they stay in sync with
+// api/generate-content.js and the daily-content store.
 
 // ---------------------------------------------------------------------
 // Step 1 — Text synthesis (niche-aware agent)
@@ -279,26 +254,15 @@ async function runHistoricalTextAgent(currentDate, nicheId, signal) {
     throw new Error(`Text API responded ${response.status}: ${errBody.slice(0, 300)}`);
   }
   const data = await response.json();
-  const textBlock = Array.isArray(data?.content)
-    ? data.content.find((b) => b && b.type === 'text')
-    : null;
-  const rawText = (
-    textBlock?.text ??
-    data?.choices?.[0]?.message?.content ??
-    data?.reply ??
-    data?.output?.text ??
-    data?.text ??
-    ''
-  );
-  const usage = {
-    inputTokens:  Number(data?.usage?.input_tokens  ?? data?.usage?.prompt_tokens     ?? 0),
-    outputTokens: Number(data?.usage?.output_tokens ?? data?.usage?.completion_tokens ?? 0),
-  };
   // Return BOTH the raw text, the usage block, AND the query
   // context. The query context is what the AI filter agent needs
   // in Step 2 to know which slice of history it is selecting the
   // top item from.
-  return { rawText, queryContext, usage };
+  return {
+    rawText: extractLlmText(data),
+    queryContext,
+    usage: extractLlmUsage(data),
+  };
 }
 
 /** Normalize one archivist event into a stable shape. */
@@ -429,21 +393,8 @@ async function runFilteringAgent(currentDate, events, queryContext, signal) {
     throw new Error(`Filtering API responded ${response.status}: ${errBody.slice(0, 300)}`);
   }
   const data = await response.json();
-  const textBlock = Array.isArray(data?.content)
-    ? data.content.find((b) => b && b.type === 'text')
-    : null;
-  const text = (
-    textBlock?.text ??
-    data?.choices?.[0]?.message?.content ??
-    data?.reply ??
-    data?.output?.text ??
-    data?.text ??
-    ''
-  );
-  const usage = {
-    inputTokens:  Number(data?.usage?.input_tokens  ?? data?.usage?.prompt_tokens     ?? 0),
-    outputTokens: Number(data?.usage?.output_tokens ?? data?.usage?.completion_tokens ?? 0),
-  };
+  const text = extractLlmText(data);
+  const usage = extractLlmUsage(data);
   return { text, usage };
 }
 
@@ -660,14 +611,9 @@ async function loadFfmpegDeps() {
 /**
  * Decode a data URL into raw bytes. The image API returns
  * `data:image/jpeg;base64,...` and ffmpeg needs an actual file on
- * disk (or a stream). We decode to a Buffer and write to a temp
- * path so the ffmpeg concat demuxer can read it.
+ * disk (or a stream). Re-exported from api/_helpers.js so the
+ * ffmpeg path doesn't reach across module boundaries.
  */
-function dataUrlToBuffer(dataUrl) {
-  const match = /^data:[^;]+;base64,(.+)$/s.exec(dataUrl);
-  if (!match) return null;
-  return Buffer.from(match[1], 'base64');
-}
 
 /**
  * (b) ffmpeg path. Concatenates 4 stills into a 15s vertical MP4
@@ -827,17 +773,21 @@ async function submitMinimaxVideoTask(variant, profile, category, firstFrameImag
  * task store stays as-is — better than leaving the operator
  * with a phantom "processing" entry).
  */
-function startVideoCompletionHandlers({ submitted, nicheId, dateKey, category, duration }) {
+function startVideoCompletionHandlers({ jobs, submitted, nicheId, dateKey, category, duration }) {
   // Track how many of the submitted tasks have settled, so we know
   // when to write the full set to the daily content store.
   let resolved = 0;
-  const resolvedList = new Array(submitted.length);
+  const resolvedList = new Array(jobs.length);
 
-  for (let i = 0; i < submitted.length; i++) {
-    const task = submitted[i];
+  for (let i = 0; i < jobs.length; i++) {
+    const job = jobs[i];
+    const sub = submitted[i];
+    // Defensive: if the background submit returned fewer entries
+    // than jobs, skip the gap.
+    if (!job || !sub) continue;
     const ac = new AbortController();
     pollVideoTask({
-      taskId: task.taskId,
+      taskId: sub.taskId,
       signal: ac.signal,
       onSuccess: async ({ fileId, downloadUrl }) => {
         // 1 + 2. Try to offload the bytes to R2. Best-effort —
@@ -854,50 +804,51 @@ function startVideoCompletionHandlers({ submitted, nicheId, dateKey, category, d
             // (~2 MB per 6s clip per the user's measurement) so
             // a 3-clip day is well under 10 MB on the heap.
             const bytes = Buffer.from(await res.arrayBuffer());
-            const key = `videos/${dateKey}/${nicheId}/${task.taskId}.mp4`;
+            const key = `videos/${dateKey}/${nicheId}/${sub.taskId}.mp4`;
             const r2Url = await r2PutObject({ key, body: bytes, contentType: 'video/mp4' });
             if (r2Url) publicUrl = r2Url;
-            else console.warn(`[r2] video ${task.taskId}: upload returned no URL, using MiniMax URL`);
+            else console.warn(`[r2] video ${sub.taskId}: upload returned no URL, using MiniMax URL`);
           } catch (err) {
-            console.error(`[r2] video ${task.taskId} upload failed: ${err.message}`);
+            console.error(`[r2] video ${sub.taskId} upload failed: ${err.message}`);
             // Fall through to the MiniMax URL.
           }
         }
 
-        // 3. Hot-store the resolved URL.
-        setVideoTask(task.taskId, {
+        // 3. Hot-store the resolved URL on the LOCAL jobId
+        // (not the upstream taskId — the client polls by jobId).
+        setVideoTask(job.jobId, {
           status: 'success',
           url: publicUrl,
           fileId,
           error: null,
         });
-        resolvedList[i] = { taskId: task.taskId, url: publicUrl, title: task.title, year: task.year };
+        resolvedList[i] = { jobId: job.jobId, url: publicUrl, title: job.title, year: job.year };
         resolved++;
         if (resolved === submitted.length) {
           await persistDailyVideos(nicheId, dateKey, category, resolvedList);
         }
       },
       onFailure: ({ error }) => {
-        setVideoTask(task.taskId, {
+        setVideoTask(job.jobId, {
           status: 'failed',
           url: null,
           fileId: null,
           error: error || 'MiniMax reported task failure.',
         });
-        resolvedList[i] = { taskId: task.taskId, url: null, title: task.title, year: task.year, error: error || 'failed' };
+        resolvedList[i] = { jobId: job.jobId, url: null, title: job.title, year: job.year, error: error || 'failed' };
         resolved++;
         if (resolved === submitted.length) {
           persistDailyVideos(nicheId, dateKey, category, resolvedList).catch(() => {});
         }
       },
       onTimeout: () => {
-        setVideoTask(task.taskId, {
+        setVideoTask(job.jobId, {
           status: 'failed',
           url: null,
           fileId: null,
           error: 'Polling timeout (6 min) — MiniMax did not return a result.',
         });
-        resolvedList[i] = { taskId: task.taskId, url: null, title: task.title, year: task.year, error: 'timeout' };
+        resolvedList[i] = { jobId: job.jobId, url: null, title: job.title, year: job.year, error: 'timeout' };
         resolved++;
         if (resolved === submitted.length) {
           persistDailyVideos(nicheId, dateKey, category, resolvedList).catch(() => {});
@@ -905,14 +856,14 @@ function startVideoCompletionHandlers({ submitted, nicheId, dateKey, category, d
       },
       onTick: ({ status }) => {
         if (status !== 'processing') {
-          console.log(`[videos][poll] ${task.taskId} → ${status}`);
+          console.log(`[videos][poll] ${sub.taskId} (job ${job.jobId}) → ${status}`);
         }
       },
     }).catch((err) => {
       // pollVideoTask catches its own errors; this is the outer
       // safety net for the rare case where the helper itself
       // throws (e.g., signal handling).
-      console.error(`[videos][poll] ${task.taskId} crashed: ${err.message}`);
+      console.error(`[videos][poll] ${sub.taskId} crashed: ${err.message}`);
     });
   }
 }
@@ -1076,26 +1027,14 @@ async function bundleVideo(variant, year, images, variantIndex, signal) {
 }
 
 // ---------------------------------------------------------------------
-// Response helper — Web Fetch API Response so the handler works on
-// any runtime that mounts Web Fetch handlers (Node Express, Workers,
-// Deno, Bun, etc.).
+// Response helper + process-level safety net
 // ---------------------------------------------------------------------
-function jsonResponse(body, status = 200, extraHeaders = {}) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json', ...extraHeaders },
-  });
-}
+// Both live in api/_helpers.js (jsonResponse, installUncaughtHandlers)
+// so they are shared with api/generate-content.js and friends.
 
-// ---------------------------------------------------------------------
-// Safety net
-// ---------------------------------------------------------------------
-process.on('uncaughtException', (err) => {
-  console.error('[uncaughtException]', err);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('[unhandledRejection]', reason);
-});
+// Install the safety net once per process. The HTTP error handler
+// in server.js is the primary safety net; this is the backstop.
+installUncaughtHandlers();
 
 // ---------------------------------------------------------------------
 // Handlers
@@ -1257,15 +1196,197 @@ export const POST = withCors(async (request, ctx) => {
     const anchorYear = normalizedEvents[0]?.year ?? 'Unknown';
 
     // -----------------------------------------------------------------
+    // Async video pipeline — fire-and-forget enqueue
+    // -----------------------------------------------------------------
+    // This helper powers BOTH the T2V and I2V branches below.
+    // The pattern is the same regardless of which MiniMax video
+    // API is selected:
+    //
+    //   1. Pre-allocate a local `jobId` (UUID) for each variant.
+    //      These are the ids the CLIENT sees in the 202 response
+    //      and in the `statusUrl` query string.
+    //   2. Pre-populate the in-memory video-task store with
+    //      status='submitting' and the variant metadata so a poll
+    //      for a not-yet-submitted job still returns a structured
+    //      record (not a 404).
+    //   3. Kick off the upstream MiniMax submit AND the polling
+    //      completion handler in the background — NEITHER is
+    //      awaited. The 202 returns synchronously after step (2),
+    //      which is the entire point: the worker's CPU time on
+    //      the request path is well under 2ms.
+    //
+    // When the background submit eventually resolves, the
+    // completion handler takes over: it polls MiniMax, downloads
+    // the bytes, uploads them to Cloudflare R2, and writes the
+    // resolved URL back to the same jobId so the next poll from
+    // the client surfaces it.
+    //
+    // @param {object}   opts
+    // @param {string}   opts.provider          'minimax_video' | 'minimax_i2v'
+    // @param {object[]} opts.variants          normalized variant objects
+    // @param {object}   opts.profile           resolved niche profile
+    // @param {string}   opts.anchorYear        YYYY / 'Unknown' for the chosen event
+    // @param {string}   opts.category          'reel' | 'tall' | 'square' | 'wide'
+    // @param {string[]|null} opts.firstFrames  data:URL per variant (I2V only)
+    // @param {string}   opts.videoCallbackUrl  absolute URL the upstream host
+    //                                          POSTs to when a task resolves
+    // @param {string}   opts.niche             profile id (e.g. 'history')
+    // @param {string}   opts.nicheLabel        human-readable niche label
+    // @param {string}   opts.dateKey           YYYY-MM-DD local
+    // @param {string|null} [opts.ip]           resolved client IP, for usage log
+    // @returns {Response}  202 with the pre-allocated job list + statusUrl
+    // -----------------------------------------------------------------
+    function enqueueVideoJobs(opts) {
+      const {
+        provider,
+        variants: vs,
+        profile: prof,
+        anchorYear: ay,
+        category: cat,
+        firstFrames: ff,
+        videoCallbackUrl: cb,
+        niche: nId,
+        nicheLabel: nLabel,
+        dateKey: dK,
+        ip: clientIp,
+      } = opts;
+
+      const duration = Number.isInteger(parseInt(process.env.VIDGEN_DURATION, 10))
+        ? parseInt(process.env.VIDGEN_DURATION, 10)
+        : DEFAULT_VIDGEN_DURATION;
+
+      // (1) Pre-allocate local jobIds and pre-populate the store.
+      // Each record carries the variant metadata so the frontend
+      // can render the cards immediately, even before the upstream
+      // submit settles.
+      const jobs = vs.map((v, i) => {
+        const jobId = generateJobId();
+        setVideoTask(jobId, {
+          status: 'submitting',
+          url: null,
+          fileId: null,
+          error: null,
+          minimaxTaskId: null,
+          title: v.title,
+          year: ay,
+        });
+        return { jobId, title: v.title, hook: v.hook, script: v.script, year: ay };
+      });
+
+      const statusUrl = `${VIDEO_STATUS_PATH}?ids=${jobs.map((j) => j.jobId).join(',')}`;
+      console.log(
+        `[videos][${provider}] enqueued ${jobs.length} jobs (statusUrl=${statusUrl}) ` +
+        `— submitting to MiniMax in background`
+      );
+
+      // (2) Fire-and-forget the upstream submit + completion handler.
+      // We use a fresh AbortController (NOT request.signal — that's
+      // tied to the 202 response and would abort the moment the
+      // client disconnects, even though the work should continue
+      // in the background). A server shutdown aborts via the
+      // process exit, not via a signal we have to wire.
+      const bg = (async () => {
+        try {
+          const submitted = await submitMinimaxVideoTasks(
+            vs, prof, ay, cat, ff, cb, undefined
+          );
+          if (submitted.length === 0) {
+            // Every variant failed to submit — mark them all as
+            // failed so the client's poll surfaces the error.
+            for (const j of jobs) {
+              setVideoTask(j.jobId, {
+                status: 'failed',
+                error: 'Video submission failed (no upstream task_id returned).',
+              });
+            }
+            return;
+          }
+          // Pair each accepted MiniMax task with its local jobId
+          // and record the upstream id on the local record so the
+          // callback can reverse-lookup the jobId by minimaxTaskId.
+          for (let i = 0; i < submitted.length; i++) {
+            const job = jobs[i];
+            if (!job) continue;
+            setVideoTask(job.jobId, {
+              status: 'processing',
+              minimaxTaskId: submitted[i].taskId,
+            });
+          }
+          // Record per-second usage for the admin alert.
+          recordUsage({
+            route: '/api/generate-daily-videos',
+            niche: nId,
+            model: process.env.VIDGEN_MODEL || DEFAULT_VIDGEN_MODEL,
+            videoCount: submitted.length,
+            videoSeconds: submitted.length * duration,
+            ip: clientIp,
+          }).catch(() => {});
+          // Start server-side polling so videos complete even when
+          // the callback URL is not reachable from MiniMax's network.
+          startVideoCompletionHandlers({
+            jobs,
+            submitted,
+            nicheId: nId,
+            dateKey: dK,
+            category: cat,
+            duration,
+          });
+        } catch (err) {
+          console.error(`[videos][${provider}] background submit crashed:`, err);
+          // Mark every job as failed so the client can surface it.
+          for (const j of jobs) {
+            setVideoTask(j.jobId, {
+              status: 'failed',
+              error: err?.message || 'Background submit crashed.',
+            });
+          }
+        }
+      })();
+      // Detach the promise: we explicitly do NOT await it.
+      // (Assigning to a no-op variable makes the intent obvious
+      // to linters without leaking a handler warning.)
+      void bg;
+
+      // (3) 202 Accepted — well under 2ms of Node CPU time spent
+      // between the request arriving and this response going out.
+      return jsonResponse(
+        {
+          status: 'processing',
+          provider,
+          dateKey: dK,
+          generatedAt: new Date().toISOString(),
+          niche: nId,
+          nicheLabel: nLabel,
+          category: cat,
+          tasks: jobs,
+          statusUrl,
+        },
+        202,
+        { Location: statusUrl }
+      );
+    }
+
+    // -----------------------------------------------------------------
     // BRANCH — Text-to-video provider (BUNDLE_PROVIDER=minimax_video)
     //
     // When this provider is selected, the pipeline does NOT
     // generate the 4 stills per variant (the text-to-video model
-    // produces motion from the prompt directly). We submit one
-    // task per variant and return 202 with the task IDs so the
-    // frontend polls /api/video-status for completion. The server
-    // is decoupled from the long-running render — MiniMax POSTs
-    // back to /api/video-callback when each task resolves.
+    // produces motion from the prompt directly).
+    //
+    // The 202 response is returned immediately after the
+    // pre-allocation step (well under 2ms of Node CPU time):
+    //   1. A local `jobId` (UUID) is generated for each variant
+    //      and pre-populated in the in-memory video-task store
+    //      with status='submitting'.
+    //   2. The actual MiniMax submission is kicked off in the
+    //      background — it runs without awaiting, so the HTTP
+    //      handler can return the 202 right away.
+    //   3. The completion handler (polling + R2 upload) is wired
+    //      up in the same fire-and-forget chain.
+    //
+    // The client polls /api/video-status?ids=<jobId1>,<jobId2>,…
+    // to discover when each task reaches `success` (and the `url`
+    // field becomes the R2-hosted video URL).
     // -----------------------------------------------------------------
     if (process.env.BUNDLE_PROVIDER === 'minimax_video') {
       if (!videoCallbackUrl) {
@@ -1273,53 +1394,19 @@ export const POST = withCors(async (request, ctx) => {
           error: 'Could not derive callback URL from the incoming request.',
         }, 500);
       }
-      console.log(`[videos][step4-t2v] submitting ${variants.length} tasks to MiniMax (callback=${videoCallbackUrl}) ...`);
-      const submitted = await submitMinimaxVideoTasks(
-        variants, profile, anchorYear, category, null, videoCallbackUrl, request.signal
-      );
-      if (submitted.length === 0) {
-        return jsonResponse({
-          error: 'Text-to-video submission failed for every variant.',
-        }, 502);
-      }
-      // Record video-usage now that the tasks are accepted by the
-      // gateway. We price per-second so a 6s clip and a 12s clip
-      // surface different cost lines in the admin alert.
-      const t2vDuration = Number.isInteger(parseInt(process.env.VIDGEN_DURATION, 10))
-        ? parseInt(process.env.VIDGEN_DURATION, 10)
-        : DEFAULT_VIDGEN_DURATION;
-      recordUsage({
-        route: '/api/generate-daily-videos',
+      return enqueueVideoJobs({
+        provider: 'minimax_video',
+        variants,
+        profile,
+        anchorYear,
+        category,
+        firstFrames: null,
+        videoCallbackUrl,
         niche: profile.id,
-        model: process.env.VIDGEN_MODEL || DEFAULT_VIDGEN_MODEL,
-        videoCount: submitted.length,
-        videoSeconds: submitted.length * t2vDuration,
+        nicheLabel: profile.label,
+        dateKey,
         ip: ctx?.ip || null,
-      }).catch(() => {});
-      const statusUrl = `${VIDEO_STATUS_PATH}?ids=${submitted.map((t) => t.taskId).join(',')}`;
-      console.log(`[videos][step4-t2v] submitted ${submitted.length}/${variants.length} tasks; statusUrl=${statusUrl}`);
-      // Start server-side polling so the videos complete even when
-      // the callback URL isn't reachable from MiniMax's network.
-      startVideoCompletionHandlers({
-        submitted, nicheId: profile.id, dateKey, category, duration: t2vDuration,
       });
-      // 202 Accepted — the work continues asynchronously, frontend
-      // polls statusUrl for completion.
-      return jsonResponse(
-        {
-          status: 'processing',
-          provider: 'minimax_video',
-          dateKey,
-          generatedAt: new Date().toISOString(),
-          niche: profile.id,
-          nicheLabel: profile.label,
-          category,
-          tasks: submitted,
-          statusUrl,
-        },
-        202,
-        { Location: statusUrl }
-      );
     }
 
     // -----------------------------------------------------------------
@@ -1331,6 +1418,13 @@ export const POST = withCors(async (request, ctx) => {
     // anchor instead of inventing the opening frame. Only one
     // image call per variant here (vs 4 for the carousel path) —
     // the I2V model does the rest.
+    //
+    // The image generation is done synchronously (a fast burst of
+    // 1 image per variant) BEFORE the enqueue, because the
+    // first-frame image is part of the upstream submit payload. The
+    // upstream submit itself is still fire-and-forget so the 202
+    // returns in <2ms of Node CPU time once the image burst
+    // completes.
     // -----------------------------------------------------------------
     if (process.env.BUNDLE_PROVIDER === 'minimax_i2v') {
       if (!videoCallbackUrl) {
@@ -1350,58 +1444,19 @@ export const POST = withCors(async (request, ctx) => {
       if (failedCount > 0) {
         console.warn(`[videos][step3-i2v] ${failedCount} variant(s) dropped — first frame failed`);
       }
-      console.log(`[videos][step4-i2v] submitting ${validPairs.length} I2V tasks to MiniMax (callback=${videoCallbackUrl}) ...`);
-      const submitted = await submitMinimaxVideoTasks(
-        validPairs.map((p) => p.variant),
+      return enqueueVideoJobs({
+        provider: 'minimax_i2v',
+        variants: validPairs.map((p) => p.variant),
         profile,
         anchorYear,
         category,
-        validPairs.map((p) => p.firstFrame),
+        firstFrames: validPairs.map((p) => p.firstFrame),
         videoCallbackUrl,
-        request.signal
-      );
-      if (submitted.length === 0) {
-        return jsonResponse({
-          error: 'Image-to-video submission failed for every variant.',
-        }, 502);
-      }
-      // Record video-usage for the I2V submissions. The image
-      // burst in this branch was just Step 3-i2v — one image per
-      // variant (the first frame), not the full 3×4 carousel
-      // image burst below.
-      const i2vDuration = Number.isInteger(parseInt(process.env.VIDGEN_DURATION, 10))
-        ? parseInt(process.env.VIDGEN_DURATION, 10)
-        : DEFAULT_VIDGEN_DURATION;
-      recordUsage({
-        route: '/api/generate-daily-videos',
         niche: profile.id,
-        model: process.env.VIDGEN_MODEL || DEFAULT_VIDGEN_MODEL,
-        videoCount: submitted.length,
-        videoSeconds: submitted.length * i2vDuration,
+        nicheLabel: profile.label,
+        dateKey,
         ip: ctx?.ip || null,
-      }).catch(() => {});
-      const statusUrl = `${VIDEO_STATUS_PATH}?ids=${submitted.map((t) => t.taskId).join(',')}`;
-      console.log(`[videos][step4-i2v] submitted ${submitted.length}/${validPairs.length} tasks; statusUrl=${statusUrl}`);
-      // Start server-side polling so the videos complete even when
-      // the callback URL isn't reachable from MiniMax's network.
-      startVideoCompletionHandlers({
-        submitted, nicheId: profile.id, dateKey, category, duration: i2vDuration,
       });
-      return jsonResponse(
-        {
-          status: 'processing',
-          provider: 'minimax_i2v',
-          dateKey,
-          generatedAt: new Date().toISOString(),
-          niche: profile.id,
-          nicheLabel: profile.label,
-          category,
-          tasks: submitted,
-          statusUrl,
-        },
-        202,
-        { Location: statusUrl }
-      );
     }
 
     // -----------------------------------------------------------------

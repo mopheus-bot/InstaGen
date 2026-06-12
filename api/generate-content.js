@@ -28,10 +28,19 @@
 // ---------------------------------------------------------------------
 import { resolveNicheProfile } from './niche_profiles.js';
 import { buildNicheQuery } from './niche_queries.js';
-import { withCors, getClientIp } from './_request.js';
+import { withCors } from './_request.js';
 import { recordUsage } from './_usage.js';
 import { setDailyContent } from './daily_content_store.js';
 import { r2PutObject, r2Configured } from './cf_r2.js';
+import {
+  jsonResponse,
+  getDateKey,
+  getPrettyDate,
+  sanitizeLlmOutput,
+  extractLlmText,
+  extractLlmUsage,
+  installUncaughtHandlers,
+} from './_helpers.js';
 
 // ---------------------------------------------------------------------
 // Constants
@@ -62,25 +71,10 @@ const TARGET_SLIDE_COUNT = 8;
 // ---------------------------------------------------------------------
 
 // ---------------------------------------------------------------------
-// Date helpers (run on the server, use server-local timezone)
+// Date helpers (server-local timezone) + LLM output sanitization
 // ---------------------------------------------------------------------
-
-/** YYYY-MM-DD in the server's local timezone. Used as `dateKey` in the response. */
-function getDateKey() {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
-
-/** "January 7" style label injected into the system prompt. */
-function getPrettyDate() {
-  return new Date().toLocaleDateString('en-US', {
-    month: 'long',
-    day: 'numeric',
-  });
-}
+// Imported from api/_helpers.js so they stay in sync with the
+// video pipeline.
 
 // ---------------------------------------------------------------------
 // Step 1 — Text synthesis (niche-aware agent)
@@ -199,72 +193,10 @@ async function runHistoricalTextAgent(currentDate, nicheId, signal) {
   }
 
   const data = await response.json();
-
-  // Primary: Anthropic Messages shape — `content` is an array of blocks.
-  // Find the first block whose type is "text" and return its `text`.
-  const content = Array.isArray(data?.content) ? data.content : [];
-  const textBlock = content.find((b) => b && b.type === 'text');
-
-  // Fallbacks: OpenAI chat-completions shape and a few other
-  // belt-and-suspenders fields in case the gateway ever varies.
-  const text = (
-    textBlock?.text ??
-    data?.choices?.[0]?.message?.content ??
-    data?.reply ??
-    data?.output?.text ??
-    data?.text ??
-    ''
-  );
-
-  // Return the text AND the usage block so the caller can charge
-  // for the call. The Anthropic Messages shape puts
-  //   { input_tokens, output_tokens }
-  // at the top level of the response. OpenAI chat-completions uses
-  //   { prompt_tokens, completion_tokens, total_tokens }.
-  // We accept both.
-  const usage = {
-    inputTokens:  Number(data?.usage?.input_tokens  ?? data?.usage?.prompt_tokens     ?? 0),
-    outputTokens: Number(data?.usage?.output_tokens ?? data?.usage?.completion_tokens ?? 0),
+  return {
+    text: extractLlmText(data),
+    usage: extractLlmUsage(data),
   };
-  return { text, usage };
-}
-
-/**
- * Defensively sanitizes the LLM string before JSON.parse().
- *
- * Steps (in order):
- *   1. Trim outer whitespace.
- *   2. Explicit conditional checks to strip a leading ```json or ```
- *      markdown fence if the model slipped one in.
- *   3. Strip a trailing ``` markdown fence.
- *   4. Final trim pass.
- *
- * Does NOT call JSON.parse() — the caller does that inside its own
- * try/catch so a syntax anomaly is caught gracefully.
- */
-function sanitizeLlmOutput(rawText) {
-  if (typeof rawText !== 'string' || rawText.length === 0) {
-    throw new Error('LLM returned empty or non-string content.');
-  }
-
-  // 1) Outer whitespace.
-  let cleaned = rawText.trim();
-
-  // 2) Explicit fallback conditional checks for the leading fence.
-  if (cleaned.startsWith('```json')) {
-    cleaned = cleaned.slice('```json'.length);
-  } else if (cleaned.startsWith('```')) {
-    cleaned = cleaned.slice(3);
-  }
-
-  // 3) Trailing fence (the CRITICAL CONSTRAINT in the system prompt
-  // tells the model not to emit one, but we belt-and-suspenders it).
-  if (cleaned.endsWith('```')) {
-    cleaned = cleaned.slice(0, -3);
-  }
-
-  // 4) Final trim after stripping.
-  return cleaned.trim();
 }
 
 /**
@@ -504,16 +436,12 @@ async function generateImageSafely(apiKey, imagePrompt, slideIndex, styleSuffix,
 }
 
 // ---------------------------------------------------------------------
-// Response helper — wraps a JS value in a Web Fetch API Response so the
-// handler works on both the Node.js Express runtime and any other
-// platform that mounts Web Fetch handlers (Workers, Deno, Bun, etc.).
+// Response helper + process-level safety net
 // ---------------------------------------------------------------------
-function jsonResponse(body, status = 200, extraHeaders = {}) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json', ...extraHeaders },
-  });
-}
+// Both live in api/_helpers.js (jsonResponse, installUncaughtHandlers)
+// so they are shared with api/generate-daily-videos.js. Install the
+// safety net once per process.
+installUncaughtHandlers();
 
 // ---------------------------------------------------------------------
 // Handler — exported as a NAMED export per HTTP method (Web Fetch API
@@ -523,17 +451,6 @@ function jsonResponse(body, status = 200, extraHeaders = {}) {
 // `(req, res) => void` Node.js signature and our return value would
 // have been ignored. Named export = unambiguous, future-proof.
 // ---------------------------------------------------------------------
-
-// Last-resort safety net. If anything in the handler throws outside the
-// top-level try/catch (unhandled async rejection, sync throw from a
-// top-level constant initializer, etc.), catch it and try to send a
-// 500 instead of taking the Express process down.
-process.on('uncaughtException', (err) => {
-  console.error('[uncaughtException]', err);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('[unhandledRejection]', reason);
-});
 
 export const GET = withCors(async (_request, ctx) => {
   // Friendly response for direct browser hits (e.g., someone pasting

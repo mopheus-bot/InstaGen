@@ -61,39 +61,11 @@ import { startDailyFlusher } from './api/daily_content_store.js';
 // always emitted so Cloudflare's cache and the browser HTTP cache
 // do not collapse per-origin responses.
 
+import { isAllowedOrigin, _internal as reqInternal } from './api/_request.js';
+
 const PUBLIC_URL = process.env.PUBLIC_URL || '';
-const APEX_HOST = (() => {
-  if (!PUBLIC_URL) return null;
-  try {
-    const withScheme = /^https?:\/\//i.test(PUBLIC_URL)
-      ? PUBLIC_URL
-      : `https://${PUBLIC_URL}`;
-    return new URL(withScheme).host.toLowerCase();
-  } catch {
-    return null;
-  }
-})();
-
-const EXPLICIT_ORIGINS = new Set(
-  (process.env.ALLOWED_ORIGINS || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0)
-);
-
-function isAllowedOrigin(origin) {
-  if (!origin) return false;
-  let parsed;
-  try {
-    parsed = new URL(origin);
-  } catch {
-    return false;
-  }
-  const normalized = parsed.origin.toLowerCase();
-  if (EXPLICIT_ORIGINS.has(normalized)) return true;
-  if (APEX_HOST && parsed.host.toLowerCase() === APEX_HOST) return true;
-  return false;
-}
+const APEX_HOST = reqInternal.APEX_HOST;
+const EXPLICIT_ORIGINS = reqInternal.EXPLICIT_ORIGINS;
 
 const corsOptions = {
   // Per-request origin check. Returning false (instead of the
