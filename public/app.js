@@ -289,19 +289,38 @@ async function requestGeneration() {
  * or { kind: 'async', tasks, statusUrl, generatedAt }.
  */
 async function submitVideoGeneration() {
-  const response = await fetch(VIDEO_API_ENDPOINT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      niche: getNiche(activeNiche).id,
-    }),
-  });
+  // Frontend timeout: 60 s. The I2V handler returns 202 after
+  // submission (typically 30–45 s), so 60 s is a comfortable
+  // ceiling. If the request hangs longer (e.g., Cloudflare's
+  // free-tier 100 s upstream timeout fires BEFORE our handler
+  // returns and the browser sees a non-JSON 502), we abort
+  // cleanly and surface a useful error.
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), 60_000);
+  let response;
+  try {
+    response = await fetch(VIDEO_API_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        niche: getNiche(activeNiche).id,
+      }),
+      signal: ac.signal,
+    });
+  } catch (err) {
+    clearTimeout(t);
+    if (err?.name === 'AbortError') {
+      throw new Error('Request timed out after 60 s. The server may be slow or unreachable.');
+    }
+    throw new Error(`Network error: ${err?.message || err}`);
+  }
+  clearTimeout(t);
 
   let data;
   try {
     data = await response.json();
   } catch {
-    throw new Error(`Server returned a non-JSON response (HTTP ${response.status}).`);
+    throw new Error(`Server returned a non-JSON response (HTTP ${response.status}). The upstream may have timed out — try again in a moment.`);
   }
   if (!response.ok) {
     throw new Error(data?.error || `Request failed with status ${response.status}`);
@@ -500,6 +519,7 @@ function enterVideoLoadingState() {
   // arrives — it gets cleared/replaced on success.
   els.videosLoading.hidden = false;
   els.generateVideosBtn.disabled = true;
+  els.generateVideosBtn.classList.add('is-loading');
   els.generateVideosBtnLabel.textContent = 'Generating Videos...';
 
   // Smooth-scroll the spinner into view on small screens.
@@ -540,14 +560,23 @@ function enterVideoLoadingState() {
 function exitVideoLoadingState() {
   els.videosLoading.hidden = true;
   els.generateVideosBtn.disabled = false;
+  els.generateVideosBtn.classList.remove('is-loading');
   els.generateVideosBtnLabel.textContent = 'Regenerate Videos';
 }
 
-/** Show a video-specific error in the banner; restore the button. */
+/**
+ * Show a video-specific error. Belt-and-suspenders: writes to the
+ * inline `videosError` element AND fires a top-of-page toast so
+ * the user sees the error regardless of which section is
+ * currently visible. The toast is what the user sees if the
+ * videos section happens to be hidden (e.g., on a fresh page
+ * before any photos are generated).
+ */
 function showVideoError(message) {
   els.videosError.textContent = message;
   els.videosError.hidden = false;
   els.videosError.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  showToast('Videos: ' + message, 'error');
 }
 
 // ---------------------------------------------------------------------
@@ -877,6 +906,36 @@ function dismissBackPill() {
   clearTimeout(backPillTimer);
   backPillTimer = null;
   if (backPillEl) backPillEl.classList.remove('visible');
+}
+
+// ---------------------------------------------------------------------
+// Toast notifications — always-visible errors
+// ---------------------------------------------------------------------
+// A single floating toast at the top of the page that fires for
+// video errors. The inline `videosError` element lives inside the
+// (often-hidden) videos section; the toast is independent of any
+// section's visibility, so the user sees the error regardless of
+// where they are on the page.
+
+let toastEl = null;
+let toastTimer = null;
+function showToast(message, kind = 'ok') {
+  if (!toastEl) {
+    toastEl = document.createElement('div');
+    toastEl.className = 'instagen-toast';
+    toastEl.setAttribute('role', 'status');
+    document.body.appendChild(toastEl);
+  }
+  toastEl.className = `instagen-toast ${kind}`;
+  toastEl.textContent = message;
+  // Re-trigger the entrance animation by toggling the visible class.
+  toastEl.classList.remove('visible');
+  void toastEl.offsetWidth;
+  toastEl.classList.add('visible');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    if (toastEl) toastEl.classList.remove('visible');
+  }, 8000);
 }
 
 function slugify(s) {
