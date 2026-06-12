@@ -46,6 +46,7 @@ import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { gateMiddleware, handleAuthPost, handleAuthLogout } from './api/_gate.js';
 
 // ---------------------------------------------------------------------
 // Dynamic CORS — same allowlist rules as api/_request.js
@@ -149,6 +150,23 @@ app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 app.use('/api', cors(corsOptions));
 
 // ---------------------------------------------------------------------
+// Passcode gate
+// ---------------------------------------------------------------------
+// Every request to the app — pages, static assets, and /api/* —
+// must pass this middleware before the route handler runs.
+// Unauthenticated callers see an iPhone-style passcode screen;
+// correct entry flips them into a signed HTTP-only session
+// cookie and the original request continues.
+//
+// Exempt paths (handled inside the middleware):
+//   - /api/auth, /api/auth/logout   — verify the passcode, log out
+//   - /api/health                   — liveness probe from the
+//                                    container's own network
+// The gate is intentionally mounted BEFORE the rate limiters so
+// a flood of unauthenticated traffic can't burn rate-limit memory.
+app.use(gateMiddleware());
+
+// ---------------------------------------------------------------------
 // Rate limiting
 // ---------------------------------------------------------------------
 // Two tiers:
@@ -204,6 +222,12 @@ const apiHandlers = {
   'generate-daily-videos':  (await import('./api/generate-daily-videos.js')),
   'video-callback':         (await import('./api/video-callback.js')),
   'video-status':           (await import('./api/video-status.js')),
+  // Admin routes live under /api/admin/* — mount with the literal
+  // 'admin/usage' slug so mountApiRoute puts the GET and POST on
+  // the same path the admin dashboard fetches. Sub-actions
+  // (clear, test) are dispatched on the `action` field of the
+  // POST body, not on the URL.
+  'admin/usage':            (await import('./api/admin.js')),
 };
 
 function mountApiRoute(slug, mod) {
@@ -273,6 +297,39 @@ for (const [slug, mod] of Object.entries(apiHandlers)) {
   mountApiRoute(slug, mod);
 }
 
+// ---------------------------------------------------------------------
+// /api/auth — passcode verify + logout
+// ---------------------------------------------------------------------
+// The gate middleware whitelists /api/auth so these endpoints are
+// reachable without a session. They emit the signed session cookie
+// on success so the NEXT request is allowed through by the gate.
+app.post('/api/auth', async (req, res) => {
+  const proto = req.protocol;
+  const host = req.get('host');
+  const url = `${proto}://${host}/api/auth`;
+  const headers = new Headers();
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (Array.isArray(v)) v.forEach((vv) => headers.append(k, vv));
+    else if (v != null) headers.set(k, String(v));
+  }
+  let body;
+  if (req.body && Object.keys(req.body).length > 0) {
+    body = JSON.stringify(req.body);
+  }
+  const webRequest = new Request(url, { method: 'POST', headers, body });
+  const webResponse = await handleAuthPost(webRequest);
+  res.status(webResponse.status);
+  webResponse.headers.forEach((v, k) => res.setHeader(k, v));
+  res.end(Buffer.from(await webResponse.arrayBuffer()));
+});
+
+app.post('/api/auth/logout', async (_req, res) => {
+  const webResponse = handleAuthLogout();
+  res.status(webResponse.status);
+  webResponse.headers.forEach((v, k) => res.setHeader(k, v));
+  res.end(Buffer.from(await webResponse.arrayBuffer()));
+});
+
 // Health check.
 app.get('/api/health', (_req, res) => {
   res.json({
@@ -290,12 +347,19 @@ app.get('/api/health', (_req, res) => {
 // /generator.html automatically (clean URL).
 
 const publicDir = resolve(__dirname, 'public');
-app.use(express.static(publicDir, { extensions: ['html'] }));
 
-// Explicit clean-URL routes (so /generator and / both work even
-// when the static lookup order would otherwise be ambiguous).
+// Explicit clean-URL routes (so /generator, /, and /admin all
+// work even when the static lookup order would otherwise be
+// ambiguous). These MUST be registered before express.static —
+// otherwise express.static 301-redirects /admin → /admin/,
+// which the browser follows but breaks the "this URL is the
+// admin" mental model.
 app.get('/generator', (_req, res) => res.sendFile(resolve(publicDir, 'generator.html')));
 app.get('/', (_req, res) => res.sendFile(resolve(publicDir, 'index.html')));
+app.get('/admin', (_req, res) => res.sendFile(resolve(publicDir, 'admin/index.html')));
+app.get('/admin/', (_req, res) => res.sendFile(resolve(publicDir, 'admin/index.html')));
+
+app.use(express.static(publicDir, { extensions: ['html'] }));
 
 // ---------------------------------------------------------------------
 // Error handler — last resort. Always returns JSON so the browser

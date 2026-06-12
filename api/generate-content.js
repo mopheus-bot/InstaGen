@@ -29,6 +29,7 @@
 import { resolveNicheProfile } from './niche_profiles.js';
 import { buildNicheQuery } from './niche_queries.js';
 import { withCors, getClientIp } from './_request.js';
+import { recordUsage } from './_usage.js';
 
 // ---------------------------------------------------------------------
 // Constants
@@ -204,7 +205,7 @@ async function runHistoricalTextAgent(currentDate, nicheId, signal) {
 
   // Fallbacks: OpenAI chat-completions shape and a few other
   // belt-and-suspenders fields in case the gateway ever varies.
-  return (
+  const text = (
     textBlock?.text ??
     data?.choices?.[0]?.message?.content ??
     data?.reply ??
@@ -212,6 +213,18 @@ async function runHistoricalTextAgent(currentDate, nicheId, signal) {
     data?.text ??
     ''
   );
+
+  // Return the text AND the usage block so the caller can charge
+  // for the call. The Anthropic Messages shape puts
+  //   { input_tokens, output_tokens }
+  // at the top level of the response. OpenAI chat-completions uses
+  //   { prompt_tokens, completion_tokens, total_tokens }.
+  // We accept both.
+  const usage = {
+    inputTokens:  Number(data?.usage?.input_tokens  ?? data?.usage?.prompt_tokens     ?? 0),
+    outputTokens: Number(data?.usage?.output_tokens ?? data?.usage?.completion_tokens ?? 0),
+  };
+  return { text, usage };
 }
 
 /**
@@ -494,7 +507,9 @@ export const POST = withCors(async (request, ctx) => {
     // Hand the dynamically-resolved current date AND the requested
     // niche id to the agent. The agent resolves the id to a full
     // profile (system prompt, temperature) via the factory.
-    const rawLlmText = await runHistoricalTextAgent(prettyDate, profile.id, request.signal);
+    const llmResult = await runHistoricalTextAgent(prettyDate, profile.id, request.signal);
+    const rawLlmText = llmResult?.text ?? '';
+    const textUsage  = llmResult?.usage ?? { inputTokens: 0, outputTokens: 0 };
 
     if (!rawLlmText) {
       throw new Error('Text API returned empty content.');
@@ -553,6 +568,30 @@ export const POST = withCors(async (request, ctx) => {
 
     const successCount = imageUrls.filter((u) => u !== PLACEHOLDER_IMAGE && !u.startsWith('data:image/')).length;
     console.log(`[image] ${successCount}/${targetEvents.length} succeeded`);
+
+    // -----------------------------------------------------------------
+    // STEP 2.5 — Record usage (text + images) for the admin alert.
+    // -----------------------------------------------------------------
+    // Two separate recordUsage calls: one for the text agent (token
+    // counts) and one for the image burst (count of generated
+    // images, priced at the per-image rate). The notifier fires
+    // once per call so the operator sees a text row AND an image
+    // row in Telegram, making a runaway image loop obvious.
+    recordUsage({
+      route: '/api/generate-content',
+      niche: profile.id,
+      model: 'MiniMax-M3',
+      textInputTokens:  textUsage.inputTokens,
+      textOutputTokens: textUsage.outputTokens,
+      ip: ctx?.ip || null,
+    }).catch(() => {});
+    recordUsage({
+      route: '/api/generate-content',
+      niche: profile.id,
+      model: 'image-01',
+      imageCount: successCount,
+      ip: ctx?.ip || null,
+    }).catch(() => {});
 
     // -----------------------------------------------------------------
     // STEP 3 — Assemble the response payload (matches the frontend

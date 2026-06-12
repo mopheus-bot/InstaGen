@@ -57,6 +57,7 @@
 import { resolveNicheProfile } from './niche_profiles.js';
 import { buildNicheQuery } from './niche_queries.js';
 import { withCors, getClientIp, getPublicOrigin } from './_request.js';
+import { recordUsage } from './_usage.js';
 
 // ---------------------------------------------------------------------
 // Constants
@@ -281,10 +282,15 @@ async function runHistoricalTextAgent(currentDate, nicheId, signal) {
     data?.text ??
     ''
   );
-  // Return BOTH the raw text and the query context. The query
-  // context is what the AI filter agent needs in Step 2 to know
-  // which slice of history it is selecting the top item from.
-  return { rawText, queryContext };
+  const usage = {
+    inputTokens:  Number(data?.usage?.input_tokens  ?? data?.usage?.prompt_tokens     ?? 0),
+    outputTokens: Number(data?.usage?.output_tokens ?? data?.usage?.completion_tokens ?? 0),
+  };
+  // Return BOTH the raw text, the usage block, AND the query
+  // context. The query context is what the AI filter agent needs
+  // in Step 2 to know which slice of history it is selecting the
+  // top item from.
+  return { rawText, queryContext, usage };
 }
 
 /** Normalize one archivist event into a stable shape. */
@@ -418,7 +424,7 @@ async function runFilteringAgent(currentDate, events, queryContext, signal) {
   const textBlock = Array.isArray(data?.content)
     ? data.content.find((b) => b && b.type === 'text')
     : null;
-  return (
+  const text = (
     textBlock?.text ??
     data?.choices?.[0]?.message?.content ??
     data?.reply ??
@@ -426,6 +432,11 @@ async function runFilteringAgent(currentDate, events, queryContext, signal) {
     data?.text ??
     ''
   );
+  const usage = {
+    inputTokens:  Number(data?.usage?.input_tokens  ?? data?.usage?.prompt_tokens     ?? 0),
+    outputTokens: Number(data?.usage?.output_tokens ?? data?.usage?.completion_tokens ?? 0),
+  };
+  return { text, usage };
 }
 
 /**
@@ -1060,7 +1071,7 @@ export const POST = withCors(async (request, ctx) => {
     // of history it is picking the top item FROM.
     // -----------------------------------------------------------------
     console.log(`[videos][step1] requesting events for ${prettyDate} (${dateKey}) · niche=${profile.id} ...`);
-    const { rawText: rawEventsText, queryContext } = await runHistoricalTextAgent(prettyDate, profile.id, request.signal);
+    const { rawText: rawEventsText, queryContext, usage: step1Usage } = await runHistoricalTextAgent(prettyDate, profile.id, request.signal);
     if (!rawEventsText) throw new Error('Archivist agent returned empty content.');
 
     let events;
@@ -1096,7 +1107,9 @@ export const POST = withCors(async (request, ctx) => {
     // WITHIN the niche's intent — not just generically viral.
     // -----------------------------------------------------------------
     console.log(`[videos][step2] requesting ${TARGET_VARIANT_COUNT} variants from filtering agent ...`);
-    const rawVariantsText = await runFilteringAgent(prettyDate, normalizedEvents, queryContext, request.signal);
+    const filterResult = await runFilteringAgent(prettyDate, normalizedEvents, queryContext, request.signal);
+    const rawVariantsText = filterResult?.text ?? '';
+    const step2Usage = filterResult?.usage ?? { inputTokens: 0, outputTokens: 0 };
     if (!rawVariantsText) throw new Error('Filtering agent returned empty content.');
 
     let variantsRaw;
@@ -1158,6 +1171,20 @@ export const POST = withCors(async (request, ctx) => {
           error: 'Text-to-video submission failed for every variant.',
         }, 502);
       }
+      // Record video-usage now that the tasks are accepted by the
+      // gateway. We price per-second so a 6s clip and a 12s clip
+      // surface different cost lines in the admin alert.
+      const t2vDuration = Number.isInteger(parseInt(process.env.VIDGEN_DURATION, 10))
+        ? parseInt(process.env.VIDGEN_DURATION, 10)
+        : DEFAULT_VIDGEN_DURATION;
+      recordUsage({
+        route: '/api/generate-daily-videos',
+        niche: profile.id,
+        model: process.env.VIDGEN_MODEL || DEFAULT_VIDGEN_MODEL,
+        videoCount: submitted.length,
+        videoSeconds: submitted.length * t2vDuration,
+        ip: ctx?.ip || null,
+      }).catch(() => {});
       const statusUrl = `${VIDEO_STATUS_PATH}?ids=${submitted.map((t) => t.taskId).join(',')}`;
       console.log(`[videos][step4-t2v] submitted ${submitted.length}/${variants.length} tasks; statusUrl=${statusUrl}`);
       // 202 Accepted — the work continues asynchronously, frontend
@@ -1222,6 +1249,21 @@ export const POST = withCors(async (request, ctx) => {
           error: 'Image-to-video submission failed for every variant.',
         }, 502);
       }
+      // Record video-usage for the I2V submissions. The image
+      // burst in this branch was just Step 3-i2v — one image per
+      // variant (the first frame), not the full 3×4 carousel
+      // image burst below.
+      const i2vDuration = Number.isInteger(parseInt(process.env.VIDGEN_DURATION, 10))
+        ? parseInt(process.env.VIDGEN_DURATION, 10)
+        : DEFAULT_VIDGEN_DURATION;
+      recordUsage({
+        route: '/api/generate-daily-videos',
+        niche: profile.id,
+        model: process.env.VIDGEN_MODEL || DEFAULT_VIDGEN_MODEL,
+        videoCount: submitted.length,
+        videoSeconds: submitted.length * i2vDuration,
+        ip: ctx?.ip || null,
+      }).catch(() => {});
       const statusUrl = `${VIDEO_STATUS_PATH}?ids=${submitted.map((t) => t.taskId).join(',')}`;
       console.log(`[videos][step4-i2v] submitted ${submitted.length}/${validPairs.length} tasks; statusUrl=${statusUrl}`);
       return jsonResponse(
@@ -1274,6 +1316,37 @@ export const POST = withCors(async (request, ctx) => {
 
     const okCount = Object.values(imageMap).filter(Boolean).length;
     console.log(`[videos][step3] ${okCount}/${workItems.length} images succeeded`);
+
+    // -----------------------------------------------------------------
+    // STEP 3.5 — Record usage (text + images) for the admin alert.
+    // -----------------------------------------------------------------
+    // Text-agent calls (Step 1 archivist + Step 2 filter) are
+    // priced by token count; the image burst is priced per image.
+    // The notifier fires once per call so the operator gets a
+    // separate Telegram row for each kind of consumption.
+    recordUsage({
+      route: '/api/generate-daily-videos',
+      niche: profile.id,
+      model: 'MiniMax-M3',
+      textInputTokens:  step1Usage.inputTokens,
+      textOutputTokens: step1Usage.outputTokens,
+      ip: ctx?.ip || null,
+    }).catch(() => {});
+    recordUsage({
+      route: '/api/generate-daily-videos',
+      niche: profile.id,
+      model: 'MiniMax-M3',
+      textInputTokens:  step2Usage.inputTokens,
+      textOutputTokens: step2Usage.outputTokens,
+      ip: ctx?.ip || null,
+    }).catch(() => {});
+    recordUsage({
+      route: '/api/generate-daily-videos',
+      niche: profile.id,
+      model: 'image-01',
+      imageCount: okCount,
+      ip: ctx?.ip || null,
+    }).catch(() => {});
 
     // -----------------------------------------------------------------
     // STEP 4 — Bundle each variant into a video (or manifest stub).

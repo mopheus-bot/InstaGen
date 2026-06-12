@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#0a0a0a" />
+    <meta name="color-scheme" content="dark" />
+    <title>InstaGen — Admin</title>
+
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%230a0a0a'/%3E%3Ctext x='50' y='66' font-family='-apple-system,sans-serif' font-size='52' font-weight='700' fill='white' text-anchor='middle'%3EI%3C/text%3E%3C/svg%3E" />
+
+    <link rel="stylesheet" href="./admin.css" />
+  </head>
+  <body>
+    <main class="admin">
+      <header class="admin-header">
+        <span class="admin-eyebrow">Operator</span>
+        <h1 class="admin-title">InstaGen Admin</h1>
+        <p class="admin-subtitle">
+          Live view of every API call's tokens, image / video counts, and
+          running USD cost. Each call also fires a Telegram alert so an
+          attack is visible the moment it starts.
+        </p>
+        <div class="admin-actions">
+          <button class="btn btn-primary" id="testBtn" type="button">Send test alert</button>
+          <button class="btn" id="refreshBtn" type="button">Refresh</button>
+          <button class="btn btn-ghost" id="clearBtn" type="button">Clear log</button>
+          <button class="btn btn-ghost" id="logoutBtn" type="button">Lock</button>
+        </div>
+      </header>
+
+      <section class="totals" aria-label="Today's totals">
+        <header class="totals-head">
+          <h2 class="section-title">Today</h2>
+          <span class="totals-date" id="todayDate">—</span>
+        </header>
+        <div class="totals-grid">
+          <article class="card stat" data-stat="today-events">
+            <span class="stat-label">Calls today</span>
+            <span class="stat-value" id="statTodayEvents">—</span>
+          </article>
+          <article class="card stat" data-stat="today-text">
+            <span class="stat-label">Text tokens</span>
+            <span class="stat-value" id="statTodayText">—</span>
+            <span class="stat-sub" id="statTodayTextSub"></span>
+          </article>
+          <article class="card stat" data-stat="today-img">
+            <span class="stat-label">Images</span>
+            <span class="stat-value" id="statTodayImages">—</span>
+          </article>
+          <article class="card stat" data-stat="today-vid">
+            <span class="stat-label">Video</span>
+            <span class="stat-value" id="statTodayVideos">—</span>
+            <span class="stat-sub" id="statTodayVideoSub"></span>
+          </article>
+          <article class="card stat stat-cost" data-stat="today-usd">
+            <span class="stat-label">Today's cost</span>
+            <span class="stat-value" id="statTodayUsd">—</span>
+          </article>
+        </div>
+      </section>
+
+      <section class="totals" aria-label="Running totals">
+        <header class="totals-head">
+          <h2 class="section-title">Since restart</h2>
+        </header>
+        <div class="totals-grid">
+          <article class="card stat" data-stat="events">
+            <span class="stat-label">Calls since restart</span>
+            <span class="stat-value" id="statEvents">—</span>
+          </article>
+          <article class="card stat" data-stat="text">
+            <span class="stat-label">Text tokens</span>
+            <span class="stat-value" id="statText">—</span>
+            <span class="stat-sub" id="statTextSub"></span>
+          </article>
+          <article class="card stat" data-stat="img">
+            <span class="stat-label">Images</span>
+            <span class="stat-value" id="statImages">—</span>
+          </article>
+          <article class="card stat" data-stat="vid">
+            <span class="stat-label">Video</span>
+            <span class="stat-value" id="statVideos">—</span>
+            <span class="stat-sub" id="statVideoSub"></span>
+          </article>
+          <article class="card stat stat-cost" data-stat="usd">
+            <span class="stat-label">Running cost</span>
+            <span class="stat-value" id="statUsd">—</span>
+          </article>
+        </div>
+      </section>
+
+      <section class="card rate-card" aria-label="Rate card">
+        <h2 class="section-title">Rate card</h2>
+        <p class="rate-help">
+          Costs are derived from these per-call rates. Override with
+          <code>ADMIN_PRICE_*</code> env vars.
+        </p>
+        <div class="rate-grid" id="rateGrid"></div>
+        <p class="rate-help" id="tgStatus">
+          Telegram alerts:
+          <span id="tgStatusValue">checking…</span>
+        </p>
+      </section>
+
+      <section class="card log-card" aria-label="Recent calls">
+        <header class="log-head">
+          <h2 class="section-title">Recent calls</h2>
+          <span class="log-count" id="logCount">0</span>
+        </header>
+        <div class="log-table" id="logTable" role="table" aria-label="Recent calls table">
+          <div class="log-empty" id="logEmpty">No usage recorded yet. Trigger a generation from the hub to see entries appear.</div>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="./admin.js"></script>
+  </body>
+</html>
