@@ -47,6 +47,7 @@ import rateLimit from 'express-rate-limit';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { gateMiddleware, handleAuthPost, handleAuthLogout } from './api/_gate.js';
+import { startVideoTaskSweeper } from './api/video_task_store.js';
 
 // ---------------------------------------------------------------------
 // Dynamic CORS — same allowlist rules as api/_request.js
@@ -376,9 +377,23 @@ app.use((err, _req, res, _next) => {
 // ---------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------
+// Start the in-memory video-task garbage collector BEFORE listen()
+// so a task submitted in the first 15 minutes can never outlive the
+// sweeper's first pass. The timer is unref()'d inside the store
+// module, so it does not pin the event loop at shutdown.
+const sweeper = startVideoTaskSweeper();
+console.log(
+  `[instagen] video-task GC armed: ttl=${sweeper.ttlMs}ms ` +
+  `step=${sweeper.stepMs}ms`
+);
+
 const PORT = Number(process.env.PORT) || 3000;
-app.listen(PORT, () => {
-  console.log(`[instagen] listening on :${PORT}`);
+// Bind to 0.0.0.0 so the container is reachable on every interface
+// (Railway, Fly, Render, a raw VPS, etc.). Inside a container the
+// loopback-only default would mean the host network can't reach us
+// even though the port is mapped.
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`[instagen] listening on 0.0.0.0:${PORT}`);
   console.log(`[instagen] PUBLIC_URL=${PUBLIC_URL || '(unset)'}`);
   console.log(`[instagen] CORS apex=${APEX_HOST || '(unset)'} explicit=${[...EXPLICIT_ORIGINS].join(',') || '(none)'}`);
 });

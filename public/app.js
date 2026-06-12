@@ -20,9 +20,13 @@ import {
   subscribeActiveNiche,
   getNiche,
 } from './state.js';
+import { apiUrl } from './api-base.js';
 
-const API_ENDPOINT = '/api/generate-content';
-const VIDEO_API_ENDPOINT = '/api/generate-daily-videos';
+// API base defaults to same-origin ("/api/..."). Override via
+// window.INSTAGEN_API_BASE or <meta name="instagen-api-base"> for
+// split-architecture deploys (see public/api-base.js).
+const API_ENDPOINT = apiUrl('/api/generate-content');
+const VIDEO_API_ENDPOINT = apiUrl('/api/generate-daily-videos');
 
 // Cache is keyed by (niche, date) so picking a different niche on the
 // hub doesn't show another niche's cached carousel. The legacy single-key

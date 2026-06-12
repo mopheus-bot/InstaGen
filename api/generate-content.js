@@ -266,6 +266,63 @@ function sanitizeLlmOutput(rawText) {
 }
 
 /**
+ * Try to recover a JSON array of event objects from a raw LLM
+ * response, in three strategies:
+ *
+ *   1) `sanitizeLlmOutput` + `JSON.parse` (strips ``` fences and
+ *      tries the whole string verbatim).
+ *   2) If (1) throws, regex-extract the slice between the first
+ *      `[` and the last `]` in the sanitized string and parse that
+ *      substring. This catches the common case where the model
+ *      wraps the array in prose like:
+ *         "Sure, here are today's events: [...]\nLet me know..."
+ *   3) If (2) still throws or yields a non-array, rethrow the
+ *      original (1) error so the caller logs the most diagnostic
+ *      message (the first parser usually points at the actual
+ *      syntax issue).
+ *
+ * Returns the parsed array. Throws on any failure with the most
+ * informative error message.
+ *
+ * @param {string} rawText
+ * @returns {object[]}
+ */
+function parseEventsArray(rawText) {
+  const cleaned = sanitizeLlmOutput(rawText);
+  let firstErr;
+  try {
+    const parsed = JSON.parse(cleaned);
+    if (Array.isArray(parsed)) return parsed;
+    firstErr = new Error('parse returned non-array value.');
+  } catch (e) {
+    firstErr = e;
+  }
+
+  // Strategy 2: slice between the first [ and the last ]. If those
+  // characters don't both appear, we have nothing to extract.
+  const openIdx = cleaned.indexOf('[');
+  const closeIdx = cleaned.lastIndexOf(']');
+  if (openIdx >= 0 && closeIdx > openIdx) {
+    const slice = cleaned.slice(openIdx, closeIdx + 1);
+    try {
+      const parsed = JSON.parse(slice);
+      if (Array.isArray(parsed)) {
+        console.warn(
+          `[parse] recovered from prose-wrapped LLM output ` +
+          `(${cleaned.length - slice.length} chars trimmed).`
+        );
+        return parsed;
+      }
+    } catch (e) {
+      // Fall through — prefer the FIRST error so the log points at
+      // the actual syntax anomaly rather than the truncated slice.
+    }
+  }
+
+  throw firstErr;
+}
+
+/**
  * Normalizes one event object from the parsed array into the shape we
  * need downstream (year/title/description as strings, image_prompt
  * guaranteed to be a non-empty string).
@@ -516,29 +573,31 @@ export const POST = withCors(async (request, ctx) => {
     }
     console.log(`[text] received ${rawLlmText.length} chars`);
 
-    // Defensive JSON parse — wrap the whole thing in try/catch so a
-    // syntax anomaly (truncated array, stray character, etc.) is
-    // caught gracefully instead of crashing the process thread.
+    // Defensive JSON parse — try a few strategies in order, so a
+    // model that wraps the array in prose or drops a trailing
+    // fence still produces a valid carousel instead of 502ing the
+    // whole request.
+    //
+    //   1) Strip markdown fences (``` / ```json) then JSON.parse.
+    //   2) On failure, regex-extract the slice between the first
+    //      "[" and the matching last "]" and parse that. Handles
+    //      "Sure! Here you go: [...]\n\nLet me know if ...".
+    //   3) On failure, return a 502 with the parser error so the
+    //      caller sees a real diagnostic.
     let events;
+    let parseErr;
     try {
-      const cleaned = sanitizeLlmOutput(rawLlmText);
-      const parsed = JSON.parse(cleaned);
-      if (!Array.isArray(parsed) || parsed.length === 0) {
-        throw new Error('LLM output parsed to an empty or non-array value.');
-      }
-      events = parsed;
-    } catch (parseErr) {
-      console.error('[parse] failed:', parseErr.message);
-      console.error('[parse] raw snippet:', rawLlmText.slice(0, 500));
-      return jsonResponse({
-        error: 'Model output could not be parsed as a JSON array.',
-        details: parseErr.message,
-      }, 502);
+      events = parseEventsArray(rawLlmText);
+    } catch (e) {
+      parseErr = e;
     }
 
     if (!Array.isArray(events) || events.length === 0) {
+      console.error('[parse] failed:', parseErr?.message || 'unknown');
+      console.error('[parse] raw snippet:', rawLlmText.slice(0, 500));
       return jsonResponse({
-        error: 'Model output parsed to an empty or non-array value.',
+        error: 'Model output could not be parsed as a JSON array.',
+        details: parseErr?.message || 'parse returned empty/non-array',
       }, 502);
     }
 
@@ -566,8 +625,22 @@ export const POST = withCors(async (request, ctx) => {
       )
     );
 
-    const successCount = imageUrls.filter((u) => u !== PLACEHOLDER_IMAGE && !u.startsWith('data:image/')).length;
-    console.log(`[image] ${successCount}/${targetEvents.length} succeeded`);
+    // "Success" = the slice produced a usable image URL. The image
+    // API returns `data:image/jpeg;base64,...` URLs by default
+    // (response_format: 'base64' is requested above), so the right
+    // exclusion is "not the placeholder" — NOT "not a data URL".
+    // An earlier version of this filter also required `!data:`
+    // which silently counted every successful slice as a failure
+    // and made the admin usage / Telegram alert report `img=0`
+    // for every call.
+    const placeholderCount = imageUrls.filter(
+      (u) => u === PLACEHOLDER_IMAGE
+    ).length;
+    const successCount = imageUrls.length - placeholderCount;
+    console.log(
+      `[image] ${successCount}/${targetEvents.length} succeeded ` +
+      `(${placeholderCount} placeholder)`
+    );
 
     // -----------------------------------------------------------------
     // STEP 2.5 — Record usage (text + images) for the admin alert.

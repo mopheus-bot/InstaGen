@@ -8,6 +8,11 @@
 // the jar for the fetch() calls below.
 // =====================================================================
 
+import { apiUrl } from '../api-base.js';
+
+const ADMIN_USAGE_ENDPOINT = apiUrl('/api/admin/usage');
+const AUTH_LOGOUT_ENDPOINT  = apiUrl('/api/auth/logout');
+
 const $ = (id) => document.getElementById(id);
 
 const fmtInt = (n) => Number(n || 0).toLocaleString('en-US');
@@ -47,7 +52,7 @@ async function api(method, body) {
     credentials: 'same-origin',
   };
   if (body) opts.body = JSON.stringify(body);
-  const res = await fetch('/api/admin/usage', opts);
+  const res = await fetch(ADMIN_USAGE_ENDPOINT, opts);
   if (res.status === 401) {
     // The session expired or the cookie was cleared — bounce to
     // the gate, which will redraw the passcode screen.
@@ -202,7 +207,7 @@ async function clearLog() {
 
 async function lock() {
   // Wipe the session cookie on the server and bounce to the gate.
-  await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
+  await fetch(AUTH_LOGOUT_ENDPOINT, { method: 'POST', credentials: 'same-origin' });
   window.location.href = '/';
 }
 
