@@ -203,13 +203,25 @@ async function requestGeneration() {
 }
 
 /**
- * Triggers the video generation pipeline. Throws on network or server
- * error. Expects a JSON response shaped like:
- *   { videos: [ { url, title?, year? }, ... ] }
- * (or just an array of video objects — both are accepted so the
- * backend can settle on one shape without breaking the client).
+ * Submit a video generation request to the backend. Two response
+ * shapes are supported:
+ *
+ *   - SYNC (HTTP 200):  { videos: [...] }                  — backend
+ *     bundled the videos itself (ffmpeg, external webhook, or
+ *     manifest stub). The frontend renders immediately.
+ *
+ *   - ASYNC (HTTP 202): { status: 'processing', tasks: [...],
+ *                          statusUrl: '/api/video-status?ids=...' }
+ *     — the backend accepted the work and MiniMax is rendering
+ *     asynchronously. Frontend polls statusUrl until each task
+ *     resolves, then renders the completed videos. The status
+ *     field is normalized by the handler to 'processing' on
+ *     submit and 'completed'/'failed' on the per-task callback.
+ *
+ * Returns a tagged union: { kind: 'sync', videos, generatedAt }
+ * or { kind: 'async', tasks, statusUrl, generatedAt }.
  */
-async function requestVideoGeneration() {
+async function submitVideoGeneration() {
   const response = await fetch(VIDEO_API_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -218,38 +230,126 @@ async function requestVideoGeneration() {
     }),
   });
 
-  // Parse JSON regardless of status — the backend always returns JSON for errors.
   let data;
   try {
     data = await response.json();
   } catch {
     throw new Error(`Server returned a non-JSON response (HTTP ${response.status}).`);
   }
-
   if (!response.ok) {
     throw new Error(data?.error || `Request failed with status ${response.status}`);
   }
 
-  // Accept either `{ videos: [...] }` or a bare array.
+  // Async path: BUNDLE_PROVIDER=minimax_video or minimax_i2v.
+  // The handler returns 202 with task IDs and a statusUrl the
+  // frontend polls.
+  if (response.status === 202 && data?.statusUrl && Array.isArray(data?.tasks)) {
+    return {
+      kind: 'async',
+      tasks: data.tasks,
+      statusUrl: data.statusUrl,
+      generatedAt: data.generatedAt || new Date().toISOString(),
+    };
+  }
+
+  // Sync path: backend returned real video URLs in the body.
   const videos = Array.isArray(data) ? data : data?.videos;
   if (!Array.isArray(videos) || videos.length === 0) {
     throw new Error('Server returned no videos.');
   }
-
-  // Filter to entries that actually have a usable URL.
   const playable = videos.filter((v) => v && (v.url || v.videoUrl || v.src));
   if (playable.length === 0) {
     throw new Error('Server returned videos without playable URLs.');
   }
-
-  // Normalize the shape so the renderer doesn't have to care which
-  // field the backend used for the URL.
-  return playable.map((v) => ({
-    url: v.url || v.videoUrl || v.src,
-    title: v.title || '',
-    year: v.year || '',
-  }));
+  return {
+    kind: 'sync',
+    generatedAt: data?.generatedAt || new Date().toISOString(),
+    videos: playable.map((v) => ({
+      url: v.url || v.videoUrl || v.src,
+      title: v.title || '',
+      year: v.year || '',
+    })),
+  };
 }
+
+/**
+ * Poll the backend's /api/video-status endpoint until every task
+ * has settled (success or failed) or the timeout elapses.
+ *
+ * @param {string}   statusUrl
+ *        e.g. "/api/video-status?ids=t1,t2,t3"
+ * @param {Array}    tasks
+ *        [{ taskId, title, year }] — preserved so the rendered
+ *        video card carries the script's title/year even when
+ *        the callback doesn't echo them back.
+ * @param {Function} onUpdate
+ *        Called after each poll with the latest `videos` array
+ *        (only completed entries, in the original task order).
+ *        Lets the UI render partial results as they arrive.
+ * @param {object}   [opts]
+ * @param {number}   [opts.pollMs=5000]        Cadence between polls.
+ * @param {number}   [opts.timeoutMs=360000]   6 minutes hard cap.
+ * @returns {Promise<{videos: Array, status: 'completed'|'partial'|'timeout'}>}
+ */
+async function pollVideoStatus(statusUrl, tasks, onUpdate, opts = {}) {
+  const pollMs = Number.isFinite(opts.pollMs) ? opts.pollMs : 5000;
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 6 * 60 * 1000;
+  const start = Date.now();
+
+  // Resolve statusUrl against the API base. statusUrl is a
+  // server-relative path like "/api/video-status?ids=..." so we
+  // just hand it to apiUrl() which prefixes the configured base
+  // (or returns it as-is for the co-located default).
+  const pollUrl = apiUrl(statusUrl);
+
+  while (true) {
+    if (Date.now() - start > timeoutMs) {
+      return { videos: [], status: 'timeout' };
+    }
+
+    let data;
+    try {
+      const r = await fetch(pollUrl);
+      if (!r.ok) throw new Error(`status ${r.status}`);
+      data = await r.json();
+    } catch {
+      // Transient network blip — try again on the next tick.
+      await sleep(pollMs);
+      continue;
+    }
+
+    const completed = [];
+    let stillRunning = 0;
+    for (const t of tasks) {
+      const r = data?.tasks?.[t.taskId];
+      if (!r || r.status === 'processing' || r.status === 'unknown') {
+        stillRunning++;
+        continue;
+      }
+      // Terminal states:
+      //   'success' / 'completed' — render if we have a URL.
+      //   'failed'                — skip silently (the meta line
+      //                             on the grid already shows the
+      //                             total count, so the user sees
+      //                             fewer videos).
+      if ((r.status === 'success' || r.status === 'completed') && r.url) {
+        completed.push({ url: r.url, title: t.title || '', year: t.year || '' });
+      }
+    }
+
+    if (typeof onUpdate === 'function') onUpdate(completed);
+
+    if (stillRunning === 0) {
+      return {
+        videos: completed,
+        status: completed.length === tasks.length ? 'completed' : 'partial',
+      };
+    }
+    await sleep(pollMs);
+  }
+}
+
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 // ---------------------------------------------------------------------
 // UI state machines
@@ -750,13 +850,44 @@ async function handleGenerateClick() {
  * the image flow — runs in parallel conceptually but is gated behind
  * the videos section becoming visible (which only happens after the
  * carousel is on screen).
+ *
+ * Two backend paths are supported:
+ *   - SYNC: the backend bundled the videos itself (ffmpeg, external
+ *     webhook, manifest stub). We render immediately and exit.
+ *   - ASYNC: the backend accepted the work and MiniMax is rendering
+ *     in the background. We keep the loading state up, poll
+ *     /api/video-status every 5s, and re-render after every poll
+ *     so the user sees videos appear one-by-one as they complete.
  */
 async function handleGenerateVideosClick() {
   const stopLoading = enterVideoLoadingState();
 
   try {
-    const videos = await requestVideoGeneration();
-    renderVideos({ videos, generatedAt: new Date().toISOString() });
+    const result = await submitVideoGeneration();
+
+    if (result.kind === 'sync') {
+      renderVideos({ videos: result.videos, generatedAt: result.generatedAt });
+      return;
+    }
+
+    // Async path: poll for completion. Re-render the grid after
+    // every poll so partial results show up immediately. The meta
+    // line ("X videos") updates with the count.
+    const final = await pollVideoStatus(
+      result.statusUrl,
+      result.tasks,
+      (videos) => renderVideos({ videos, generatedAt: result.generatedAt })
+    );
+
+    if (final.videos.length === 0) {
+      if (final.status === 'timeout') {
+        throw new Error(
+          'Video generation timed out after 6 minutes. The tasks may still complete in the background — try again in a moment.'
+        );
+      }
+      // partial / completed-but-empty means every task failed.
+      throw new Error('No videos completed. Please try again.');
+    }
   } catch (err) {
     console.error('[generate-videos] error:', err);
     showVideoError(

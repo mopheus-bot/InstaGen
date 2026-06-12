@@ -806,14 +806,25 @@ async function submitMinimaxVideoTask(variant, profile, category, firstFrameImag
   }
   const data = await response.json();
   // Documented response shape: { task_id, base_resp: { status_code, status_msg } }
-  if (typeof data?.task_id !== 'string' || data.task_id.length === 0) {
-    throw new Error('Video API response missing task_id.');
-  }
-  // base_resp.status_code !== 0 means the submission was rejected
-  // even though the HTTP envelope was 2xx.
+  //
+  // Check `base_resp.status_code` FIRST so a rejected submission
+  // surfaces the actual reason ("invalid params", "auth failed",
+  // "callback url unreachable", etc.) instead of a misleading
+  // "missing task_id" — when MiniMax rejects a submission it
+  // returns `task_id: ""`, which would otherwise be the only
+  // signal the caller sees. Order matters: never let the empty-
+  // task_id check mask a more informative error.
   const code = data?.base_resp?.status_code;
   if (typeof code === 'number' && code !== 0) {
-    throw new Error(`Video API rejected task: ${data?.base_resp?.status_msg || `code ${code}`}`);
+    const statusMsg = data?.base_resp?.status_msg;
+    throw new Error(
+      `Video API rejected task (code ${code}` +
+      (statusMsg ? `: ${statusMsg}` : '') +
+      `)`
+    );
+  }
+  if (typeof data?.task_id !== 'string' || data.task_id.length === 0) {
+    throw new Error('Video API response missing task_id.');
   }
   return data.task_id;
 }
