@@ -731,7 +731,23 @@
             <circle cx="12" cy="12" r="4" fill="currentColor" />
           </svg>
         </span>
-        <span id="generate-btn__label">Generate Today's Content</span>
+        <span id="generate-btn__label">Generate daily photos</span>
+      </button>
+
+      <!-- Always-visible secondary action: kick off video
+           generation independently of the photos pipeline. The
+           user no longer has to wait for the photos job to
+           finish before they can request videos. -->
+      <button id="generate-videos-btn" class="generate-btn generate-btn--secondary" type="button">
+        <span class="generate-btn__icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" width="20" height="20">
+            <path
+              d="M5 4l14 8-14 8V4z"
+              fill="currentColor"
+            />
+          </svg>
+        </span>
+        <span id="generate-videos-btn__label">Generate daily videos</span>
       </button>
 
       <!-- Loading state — shown while a generation is in flight -->
@@ -765,23 +781,9 @@
           <span id="videos-meta" class="videos-meta"></span>
         </div>
 
-        <button
-          id="generate-videos-btn"
-          class="generate-btn generate-btn--secondary"
-          type="button"
-        >
-          <span class="generate-btn__icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none" width="20" height="20">
-              <path
-                d="M5 4l14 8-14 8V4z"
-                fill="currentColor"
-              />
-            </svg>
-          </span>
-          <span id="generate-videos-btn__label">Generate Videos</span>
-        </button>
-
-        <!-- Loading state — shown while /api/generate-daily-videos is in flight -->
+        <!-- Loading state — shown while /api/generate-daily-videos is in flight.
+             The trigger lives at the top of the page now, so the user can
+             kick off a video job even before the photos job has finished. -->
         <section id="videos-loading" class="loading" hidden>
           <div class="spinner" aria-label="Loading"></div>
           <div id="videos-ticker" class="loading-ticker">

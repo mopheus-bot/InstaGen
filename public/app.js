@@ -469,7 +469,7 @@ function enterLoadingState() {
 function exitLoadingState() {
   els.loading.hidden = true;
   els.generateBtn.disabled = false;
-  els.generateBtnLabel.textContent = "Generate Today's Content";
+  els.generateBtnLabel.textContent = "Generate daily photos";
 }
 
 /** Show an error message in the banner; restore the button. */
@@ -491,6 +491,11 @@ function showError(message) {
  */
 function enterVideoLoadingState() {
   els.videosError.hidden = true;
+  // The videos button is now always visible at the top of the page,
+  // so the user can kick off a video job BEFORE the photos job has
+  // run. Make sure the videos section itself is un-hidden so the
+  // loading state is actually visible.
+  els.videos.hidden = false;
   // Keep the previously rendered grid visible until the new payload
   // arrives — it gets cleared/replaced on success.
   els.videosLoading.hidden = false;
