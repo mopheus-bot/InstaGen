@@ -1,5 +1,5 @@
 // =====================================================================
-// InstaGen — Vercel serverless function
+// InstaGen — Daily videos generation handler
 // Route: POST /api/generate-daily-videos
 // =====================================================================
 // Five-step pipeline that turns one calendar day into 3 short-form videos:
@@ -33,15 +33,17 @@
 //                            packages to be installed locally — they
 //                            are NOT in package.json by default.
 //   VIDEO_TEMP_DIR           Writable directory for ffmpeg output.
-//                            Defaults to public/videos on Node, /tmp/
-//                            videos on Vercel serverless (which is
-//                            ephemeral and NOT publicly served — the
-//                            external webhook path is recommended there).
+//                            Defaults to public/videos on a long-lived
+//                            host, /tmp/videos when the deployment
+//                            filesystem is ephemeral (e.g. containers
+//                            without a mounted volume). The external
+//                            webhook path is the recommended production
+//                            answer regardless.
 //
 // Notes:
-//   - Vercel auto-routes this file to /api/generate-daily-videos. If
-//     you keep a "functions" block in vercel.json, point it at this
-//     path with maxDuration ~300.
+//   - This handler is mounted by server.js as POST /api/generate-daily-videos
+//     (Express). It uses the Web Fetch API Request/Response shape so the
+//     same code can be reused on any platform that speaks Web Fetch.
 //   - "type": "module" is set in package.json, so this file runs as
 //     native ESM — no require(), no transpilation.
 //   - request.signal is forwarded to every upstream fetch so a client
@@ -54,6 +56,7 @@
 // ---------------------------------------------------------------------
 import { resolveNicheProfile } from './niche_profiles.js';
 import { buildNicheQuery } from './niche_queries.js';
+import { withCors, getClientIp, getPublicOrigin } from './_request.js';
 
 // ---------------------------------------------------------------------
 // Constants
@@ -88,19 +91,58 @@ const SCENES_PER_VARIANT = 4;
 // cap defensively to avoid cascading failures.
 const MAX_IMAGE_PARALLELISM = 6;
 
-// File-system path for ffmpeg output. On Vercel serverless /tmp is
-// writable but NOT publicly served, so the ffmpeg path is mostly
-// useful in local dev. The external webhook path is the production
-// answer.
-const VIDEO_TEMP_DIR =
-  process.env.VIDEO_TEMP_DIR ||
-  (process.env.VERCEL ? '/tmp/videos' : 'public/videos');
+// File-system path for ffmpeg output. On ephemeral container hosts
+// (where /tmp is writable but not persisted across deploys) we use
+// /tmp/videos; on a long-lived host with a mounted volume the
+// public/videos folder is preferred so the bundled MP4 is reachable
+// by the static asset layer.
+const VIDEO_TEMP_DIR = (() => {
+  if (process.env.VIDEO_TEMP_DIR) return process.env.VIDEO_TEMP_DIR;
+  // Ephemeral container detection: RAILWAY / FLY / RENDER set
+  // environment hints that /tmp is the only writable scratch space.
+  // Set FORCE_EPHEMERAL_TMP=1 in your environment to force this path
+  // on any other host.
+  const ephemeral =
+    process.env.FORCE_EPHEMERAL_TMP === '1' ||
+    Boolean(process.env.RAILWAY_ENVIRONMENT) ||
+    Boolean(process.env.FLY_APP_NAME) ||
+    Boolean(process.env.RENDER);
+  return ephemeral ? '/tmp/videos' : 'public/videos';
+})();
 
-// Public URL prefix for the local-dev ffmpeg output. On Vercel we
-// never reach this branch (no webhook + no ffmpeg binary in the
-// serverless image), but we resolve the constant up front so the
-// URL builder below can stay simple.
+// Public URL prefix for the local-dev ffmpeg output. On a production
+// deployment we don't reach this branch (no webhook + no ffmpeg
+// binary in the container image), but we resolve the constant up
+// front so the URL builder below can stay simple.
 const VIDEO_PUBLIC_PREFIX = '/videos';
+
+// ---------------------------------------------------------------------
+// Text-to-video provider (MiniMax /v1/video_generation) — opt-in via
+// BUNDLE_PROVIDER=minimax_video. When set, the POST handler submits
+// one async task per variant and returns 202 with the task IDs; the
+// existing webhook / ffmpeg / manifest paths stay untouched.
+// Defaults are env-driven per the project spec — no hardcoded model
+// or duration constants here.
+// ---------------------------------------------------------------------
+const MINIMAX_VIDEO_URL = 'https://api.minimax.io/v1/video_generation';
+const DEFAULT_VIDGEN_MODEL = 'MiniMax-Hailuo-2.3';
+const DEFAULT_VIDGEN_DURATION = 6;
+const DEFAULT_VIDGEN_RESOLUTION = '768P';
+const VIDEO_CALLBACK_PATH = '/api/video-callback';
+const VIDEO_STATUS_PATH = '/api/video-status';
+
+// Per-category preset for the text-to-video provider. The frontend
+// passes `category` in the POST body and the engine uses the preset
+// to pick a camera command + a composition line in the prompt.
+// Unknown categories fall through to 'reel' (vertical short-form,
+// the project default).
+const CATEGORY_PRESETS = {
+  reel:   { camera: '[Static shot, Push in]', composition: 'Vertical 9:16 composition, close framing, mobile-first viewing.' },
+  tall:   { camera: '[Static shot, Push in]', composition: 'Vertical 9:16 composition, close framing, mobile-first viewing.' },
+  square: { camera: '[Static shot]',          composition: 'Square 1:1 composition, balanced framing.' },
+  wide:   { camera: '[Pan right]',            composition: 'Wide 16:9 composition, cinematic framing.' },
+};
+const DEFAULT_CATEGORY = 'reel';
 
 // ---------------------------------------------------------------------
 // Date helpers (server-local timezone)
@@ -191,7 +233,7 @@ async function runHistoricalTextAgent(currentDate, nicheId, signal) {
   // unsolved_earth) before the AI filter agent ever sees the events.
   // The directive is the first line of the user message so the model
   // reads the search brief before anything else.
-  const queryContext = buildNicheQuery(nicheId, currentDate);
+  const queryContext = buildNicheQuery(nicheId);
   console.log(
     `[videos][niche-query] active=${queryContext.id} window="${queryContext.dateWindow}" ` +
     `terms=${queryContext.searchTerms.length} categories=${queryContext.categoryFilters.length}`
@@ -531,9 +573,10 @@ async function mapWithConcurrency(items, limit, worker) {
 //
 //   (a) EXTERNAL_VIDEO_WEBHOOK set  → POST the bundle payload there,
 //                                     expect { url } back. Production
-//                                     default. Recommended for Vercel
-//                                     because /tmp is not publicly
-//                                     served and ffmpeg isn't shipped.
+//                                     default. Recommended for container
+//                                     deployments because /tmp is not
+//                                     publicly served and ffmpeg isn't
+//                                     shipped in the default image.
 //
 //   (b) BUNDLE_PROVIDER=ffmpeg       → lazy-import ffmpeg-static +
 //                                     fluent-ffmpeg, write an MP4 to
@@ -659,9 +702,188 @@ async function bundleWithFfmpeg(payload, outPath) {
     });
   } finally {
     // Best-effort cleanup of the per-variant tmp dir. Failures
-    // here are non-fatal — Vercel reaps /tmp on cold start anyway.
+    // here are non-fatal — /tmp may already be reaped on ephemeral
+    // hosts, and we don't want a cleanup error to mask the success
+    // of the bundle step above.
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+/**
+ * Build the per-variant video prompt. Combines the hook + script
+ * (the actual story), the niche's image style signature (so the
+ * text-to-video model matches the carousel aesthetic), the
+ * category's camera command + composition line, and a closing
+ * "static shot" so the final frame settles on a clean image.
+ *
+ * The MiniMax endpoint caps prompts at 2000 characters; we trim
+ * from the END of the body (hook + script) and keep the camera
+ * commands + composition + style suffix intact, since those shape
+ * the actual output.
+ */
+function buildVideoPrompt(variant, nicheProfile, category) {
+  const preset = CATEGORY_PRESETS[category] || CATEGORY_PRESETS[DEFAULT_CATEGORY];
+  // The niche's imageStyleSuffix begins with ", " (it's designed to
+  // be appended to a free-form image_prompt). For the video prompt
+  // we already have a clean composition sentence, so strip the
+  // leading separator to avoid ", ," artifacts.
+  const rawStyle = nicheProfile.imageStyleSuffix || DEFAULT_AESTHETIC_SUFFIX;
+  const styleSuffix = rawStyle.replace(/^,\s*/, '');
+  // Style + camera directives go first so they survive the trim.
+  const head = `${preset.composition} ${styleSuffix} ${preset.camera} [Static shot]`;
+  const body = `${variant.hook}\n\n${variant.script}`;
+  const combined = `${head}\n\n${body}`;
+  const PROMPT_CAP = 2000;
+  if (combined.length <= PROMPT_CAP) return combined;
+  // Trim the body, keep the head. Reserve a small joiner budget.
+  const headBudget = head.length + 4; // "\n\n" + head
+  const bodyBudget = Math.max(0, PROMPT_CAP - headBudget - 8); // " ..." ellipsis
+  return `${head}\n\n${body.slice(0, bodyBudget)} ...`;
+}
+
+/**
+ * Submit one variant to MiniMax's video_generation endpoint and
+ * return the task_id from the response. Throws on transport
+ * failure, non-2xx, or a missing task_id — the caller catches
+ * per-variant and skips the variant, mirroring the existing
+ * Step 4 fault-isolation pattern.
+ *
+ * The same endpoint handles BOTH text-to-video and image-to-video.
+ * The two modes are distinguished by whether `firstFrameImageUrl`
+ * is provided:
+ *   - T2V (text-to-video): pass `null`. The model animates from the
+ *     prompt alone.
+ *   - I2V (image-to-video): pass a data URL (or hosted URL). The
+ *     model uses it as the starting frame and the prompt describes
+ *     the motion.
+ *
+ * Per the MiniMax docs, `first_frame_image` accepts a public URL
+ * OR a base64 Data URL — the data URL we pass from our image API
+ * works as-is.
+ */
+async function submitMinimaxVideoTask(variant, profile, category, firstFrameImageUrl, callbackUrl, signal) {
+  const apiKey = process.env.MINIMAX_API_KEY;
+  const model = process.env.VIDGEN_MODEL || DEFAULT_VIDGEN_MODEL;
+  const duration = Number.isInteger(parseInt(process.env.VIDGEN_DURATION, 10))
+    ? parseInt(process.env.VIDGEN_DURATION, 10)
+    : DEFAULT_VIDGEN_DURATION;
+  const resolution = process.env.VIDGEN_RESOLUTION || DEFAULT_VIDGEN_RESOLUTION;
+
+  const prompt = buildVideoPrompt(variant, profile, category);
+  const body = {
+    model,
+    prompt,
+    duration,
+    resolution,
+    callback_url: callbackUrl,
+  };
+  if (firstFrameImageUrl) {
+    body.first_frame_image = firstFrameImageUrl;
+  }
+  const response = await fetch(MINIMAX_VIDEO_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!response.ok) {
+    const errBody = await response.text().catch(() => '<unreadable>');
+    throw new Error(`Video API responded ${response.status}: ${errBody.slice(0, 300)}`);
+  }
+  const data = await response.json();
+  // Documented response shape: { task_id, base_resp: { status_code, status_msg } }
+  if (typeof data?.task_id !== 'string' || data.task_id.length === 0) {
+    throw new Error('Video API response missing task_id.');
+  }
+  // base_resp.status_code !== 0 means the submission was rejected
+  // even though the HTTP envelope was 2xx.
+  const code = data?.base_resp?.status_code;
+  if (typeof code === 'number' && code !== 0) {
+    throw new Error(`Video API rejected task: ${data?.base_resp?.status_msg || `code ${code}`}`);
+  }
+  return data.task_id;
+}
+
+/**
+ * Submit every variant to MiniMax in parallel. Returns an array of
+ * `{ taskId, title, hook, script, year }` for the variants whose
+ * submission succeeded — failed submissions are logged and skipped
+ * (the frontend will render one fewer card).
+ *
+ * `firstFrames` is optional and must be aligned by index with
+ * `variants`. Pass `null` (or omit the entry) for T2V; pass the
+ * data URL string for I2V.
+ *
+ * Uses bounded concurrency (`mapWithConcurrency`) so we don't blow
+ * past the MiniMax gateway's per-key rate limit.
+ */
+async function submitMinimaxVideoTasks(variants, profile, year, category, firstFrames, callbackUrl, signal) {
+  const submitted = [];
+  await mapWithConcurrency(
+    variants,
+    MAX_IMAGE_PARALLELISM,
+    async (variant, vIdx) => {
+      try {
+        const firstFrame = (Array.isArray(firstFrames) && firstFrames[vIdx]) || null;
+        const taskId = await submitMinimaxVideoTask(variant, profile, category, firstFrame, callbackUrl, signal);
+        submitted[vIdx] = {
+          taskId,
+          title: variant.title,
+          hook: variant.hook,
+          script: variant.script,
+          year,
+        };
+      } catch (err) {
+        console.error(`[videos][step4-t2v] variant ${vIdx + 1} submit failed: ${err.message}`);
+      }
+    }
+  );
+  return submitted.filter(Boolean);
+}
+
+/**
+ * Generate the I2V first-frame image for each variant. For I2V,
+ * the model needs an anchor image plus a text prompt describing
+ * the motion — we use the FIRST scene from each variant
+ * (`image_prompts[0]`) so the opening frame of the video matches
+ * the opening frame of the carousel slide it accompanies.
+ *
+ * Returns an array aligned with `variants`: `{ variant, firstFrame }`
+ * on success, `null` on failure (so the caller can filter the
+ * failed pairs and skip the corresponding I2V submission).
+ *
+ * Uses the same image generator + bounded concurrency as Step 3.
+ */
+async function generateI2VFirstFrames(variants, profile, signal) {
+  const apiKey = process.env.MINIMAX_API_KEY;
+  const out = new Array(variants.length).fill(null);
+  await mapWithConcurrency(
+    variants,
+    MAX_IMAGE_PARALLELISM,
+    async (variant, vIdx) => {
+      const firstPrompt = Array.isArray(variant.image_prompts) ? variant.image_prompts[0] : null;
+      if (typeof firstPrompt !== 'string' || firstPrompt.length === 0) {
+        console.error(`[videos][step3-i2v] variant ${vIdx + 1} has no image_prompts[0]`);
+        return;
+      }
+      const url = await generateImageSafely(
+        apiKey,
+        firstPrompt,
+        `i2v-frame-v${vIdx + 1}`,
+        profile.imageStyleSuffix,
+        signal
+      );
+      if (url) {
+        out[vIdx] = { variant, firstFrame: url };
+      } else {
+        console.error(`[videos][step3-i2v] variant ${vIdx + 1} first frame generation failed`);
+      }
+    }
+  );
+  return out;
 }
 
 /**
@@ -733,7 +955,8 @@ async function bundleVideo(variant, year, images, variantIndex, signal) {
 
 // ---------------------------------------------------------------------
 // Response helper — Web Fetch API Response so the handler works on
-// both the Node and Edge Vercel runtimes.
+// any runtime that mounts Web Fetch handlers (Node Express, Workers,
+// Deno, Bun, etc.).
 // ---------------------------------------------------------------------
 function jsonResponse(body, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(body), {
@@ -756,7 +979,7 @@ process.on('unhandledRejection', (reason) => {
 // Handlers
 // ---------------------------------------------------------------------
 
-export async function GET() {
+export const GET = withCors(async () => {
   return jsonResponse(
     {
       error: 'Method not allowed.',
@@ -765,11 +988,15 @@ export async function GET() {
     405,
     { Allow: 'POST' }
   );
-}
+});
 
-export async function POST(request) {
+export const POST = withCors(async (request, ctx) => {
   // --- Auth / config guard -----------------------------------------
   const apiKey = process.env.MINIMAX_API_KEY;
+  // Log the resolved end-user IP. Behind Cloudflare the raw request
+  // IP is a CF edge IP; ctx.ip is the real client (from
+  // CF-Connecting-IP / X-Forwarded-For).
+  if (ctx?.ip) console.log(`[ip] ${ctx.ip}`);
   if (!apiKey) {
     return jsonResponse({
       error: 'Server misconfigured: MINIMAX_API_KEY is not set.',
@@ -779,23 +1006,49 @@ export async function POST(request) {
   const dateKey = getDateKey();
   const prettyDate = getPrettyDate();
 
-  // --- Niche context (from POST body) -------------------------------
-  // The frontend posts { niche: 'true-crime' | 'history' | ... }.
-  // We tolerate a missing/unknown body by letting the factory fall
-  // back to the 'history' profile, so an empty payload keeps the
-  // original engine's behavior. Both kebab-case (legacy) and
-  // snake_case (current) ids are accepted — see resolveNicheProfile.
+  // --- Niche + category context (from POST body) ---------------------
+  // The frontend posts { niche, category }. `niche` selects the
+  // persona + visual style; `category` is consumed by the text-to-
+  // video provider (BUNDLE_PROVIDER=minimax_video) to pick camera
+  // commands and a composition line. Both fields are optional —
+  // missing or unknown values fall back to defaults so an empty
+  // payload keeps the original engine's behavior.
   let requestedNiche;
+  let requestedCategory;
   try {
     const body = await request.json();
     if (body && typeof body.niche === 'string') {
       requestedNiche = body.niche;
     }
+    if (body && typeof body.category === 'string') {
+      requestedCategory = body.category;
+    }
   } catch {
-    // No body / non-JSON body — fine, the factory will fall back.
+    // No body / non-JSON body — fine, defaults apply.
   }
   const profile = resolveNicheProfile(requestedNiche);
+  const category = (requestedCategory && CATEGORY_PRESETS[requestedCategory])
+    ? requestedCategory
+    : DEFAULT_CATEGORY;
   console.log(`[niche] active=${profile.id}`);
+  console.log(`[category] active=${category}`);
+
+  // Build the absolute callback URL up front so the text-to-video
+  // provider can register it with MiniMax. We prefer PUBLIC_URL
+  // (the Cloudflare-fronted apex domain) when set, so the webhook
+  // lands on the public domain — where Cloudflare's WAF / rate
+  // limits / TLS already apply — instead of the raw deployment
+  // host. Falls back to the request's own host for local dev.
+  const videoCallbackUrl = (() => {
+    const origin = getPublicOrigin(request);
+    if (origin) return `${origin}${VIDEO_CALLBACK_PATH}`;
+    try {
+      const u = new URL(request.url);
+      return `${u.protocol}//${u.host}${VIDEO_CALLBACK_PATH}`;
+    } catch {
+      return null;
+    }
+  })();
 
   try {
     // -----------------------------------------------------------------
@@ -880,6 +1133,115 @@ export async function POST(request) {
     const anchorYear = normalizedEvents[0]?.year ?? 'Unknown';
 
     // -----------------------------------------------------------------
+    // BRANCH — Text-to-video provider (BUNDLE_PROVIDER=minimax_video)
+    //
+    // When this provider is selected, the pipeline does NOT
+    // generate the 4 stills per variant (the text-to-video model
+    // produces motion from the prompt directly). We submit one
+    // task per variant and return 202 with the task IDs so the
+    // frontend polls /api/video-status for completion. The server
+    // is decoupled from the long-running render — MiniMax POSTs
+    // back to /api/video-callback when each task resolves.
+    // -----------------------------------------------------------------
+    if (process.env.BUNDLE_PROVIDER === 'minimax_video') {
+      if (!videoCallbackUrl) {
+        return jsonResponse({
+          error: 'Could not derive callback URL from the incoming request.',
+        }, 500);
+      }
+      console.log(`[videos][step4-t2v] submitting ${variants.length} tasks to MiniMax (callback=${videoCallbackUrl}) ...`);
+      const submitted = await submitMinimaxVideoTasks(
+        variants, profile, anchorYear, category, null, videoCallbackUrl, request.signal
+      );
+      if (submitted.length === 0) {
+        return jsonResponse({
+          error: 'Text-to-video submission failed for every variant.',
+        }, 502);
+      }
+      const statusUrl = `${VIDEO_STATUS_PATH}?ids=${submitted.map((t) => t.taskId).join(',')}`;
+      console.log(`[videos][step4-t2v] submitted ${submitted.length}/${variants.length} tasks; statusUrl=${statusUrl}`);
+      // 202 Accepted — the work continues asynchronously, frontend
+      // polls statusUrl for completion.
+      return jsonResponse(
+        {
+          status: 'processing',
+          provider: 'minimax_video',
+          dateKey,
+          generatedAt: new Date().toISOString(),
+          niche: profile.id,
+          nicheLabel: profile.label,
+          category,
+          tasks: submitted,
+          statusUrl,
+        },
+        202,
+        { Location: statusUrl }
+      );
+    }
+
+    // -----------------------------------------------------------------
+    // BRANCH — Image-to-video provider (BUNDLE_PROVIDER=minimax_i2v)
+    //
+    // Same async task model as T2V, but each variant carries a
+    // first-frame image (generated from `image_prompts[0]` with the
+    // niche's image style) so the I2V model animates from a known
+    // anchor instead of inventing the opening frame. Only one
+    // image call per variant here (vs 4 for the carousel path) —
+    // the I2V model does the rest.
+    // -----------------------------------------------------------------
+    if (process.env.BUNDLE_PROVIDER === 'minimax_i2v') {
+      if (!videoCallbackUrl) {
+        return jsonResponse({
+          error: 'Could not derive callback URL from the incoming request.',
+        }, 500);
+      }
+      console.log(`[videos][step3-i2v] generating ${variants.length} first-frame images ...`);
+      const firstFrames = await generateI2VFirstFrames(variants, profile, request.signal);
+      const validPairs = firstFrames.filter(Boolean);
+      const failedCount = variants.length - validPairs.length;
+      if (validPairs.length === 0) {
+        return jsonResponse({
+          error: 'First-frame image generation failed for every variant.',
+        }, 502);
+      }
+      if (failedCount > 0) {
+        console.warn(`[videos][step3-i2v] ${failedCount} variant(s) dropped — first frame failed`);
+      }
+      console.log(`[videos][step4-i2v] submitting ${validPairs.length} I2V tasks to MiniMax (callback=${videoCallbackUrl}) ...`);
+      const submitted = await submitMinimaxVideoTasks(
+        validPairs.map((p) => p.variant),
+        profile,
+        anchorYear,
+        category,
+        validPairs.map((p) => p.firstFrame),
+        videoCallbackUrl,
+        request.signal
+      );
+      if (submitted.length === 0) {
+        return jsonResponse({
+          error: 'Image-to-video submission failed for every variant.',
+        }, 502);
+      }
+      const statusUrl = `${VIDEO_STATUS_PATH}?ids=${submitted.map((t) => t.taskId).join(',')}`;
+      console.log(`[videos][step4-i2v] submitted ${submitted.length}/${validPairs.length} tasks; statusUrl=${statusUrl}`);
+      return jsonResponse(
+        {
+          status: 'processing',
+          provider: 'minimax_i2v',
+          dateKey,
+          generatedAt: new Date().toISOString(),
+          niche: profile.id,
+          nicheLabel: profile.label,
+          category,
+          tasks: submitted,
+          statusUrl,
+        },
+        202,
+        { Location: statusUrl }
+      );
+    }
+
+    // -----------------------------------------------------------------
     // STEP 3 — Image generation for every scene in every variant.
     // Fan out 3 × 4 = 12 calls with bounded concurrency. Each
     // failure becomes null (a per-scene placeholder) rather than
@@ -960,4 +1322,4 @@ export async function POST(request) {
       details: err.message,
     }, 500);
   }
-}
+});

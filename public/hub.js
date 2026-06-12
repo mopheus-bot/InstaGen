@@ -7,7 +7,8 @@
 //   3. navigate to /generator (the dashboard reads the niche on mount)
 //
 // No build step, no framework — keeps the project on its existing
-// vanilla-JS + Vercel static hosting setup.
+// vanilla-JS + static asset hosting setup (Express serves public/
+// in production; any local dev server works the same way).
 // =====================================================================
 
 import { NICHES, setActiveNiche } from './state.js';

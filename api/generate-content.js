@@ -1,5 +1,5 @@
 // =====================================================================
-// InstaGen — Vercel serverless function
+// InstaGen — Content generation handler
 // Route: POST /api/generate-content
 // =====================================================================
 // Dual-model pipeline:
@@ -14,9 +14,9 @@
 //   MINIMAX_API_KEY
 //
 // Notes:
-//   - Vercel auto-routes this file to /api/generate-content (no vercel.json
-//     rewrite needed). If you keep a "functions" block in vercel.json, point
-//     it at "api/generate-content.js" and set maxDuration to ~300s.
+//   - This handler is mounted by server.js as POST /api/generate-content
+//     (Express). It uses the Web Fetch API Request/Response shape so the
+//     same code can be reused on any platform that speaks Web Fetch.
 //   - Place a fallback image at public/assets/placeholder-error.png so the
 //     UI never breaks when an image slice fails.
 //   - Project is "type": "module" (see package.json), so this file runs as
@@ -28,6 +28,7 @@
 // ---------------------------------------------------------------------
 import { resolveNicheProfile } from './niche_profiles.js';
 import { buildNicheQuery } from './niche_queries.js';
+import { withCors, getClientIp } from './_request.js';
 
 // ---------------------------------------------------------------------
 // Constants
@@ -114,12 +115,10 @@ function getPrettyDate() {
  *                                     (text system prompt, label,
  *                                     temperature, image suffix).
  * @param {AbortSignal}   [signal]     Optional AbortSignal — typically
- *                                     `request.signal` from the Vercel
- *                                     Web Handler. When the client
+ *                                     `request.signal` from the Web
+ *                                     Fetch handler. When the client
  *                                     disconnects, the in-flight fetch
- *                                     is cancelled (Vercel must have
- *                                     `supportsCancellation: true` for
- *                                     the signal to actually fire).
+ *                                     is cancelled.
  * @returns {Promise<string>}          The raw assistant text content.
  * @throws  If the request fails, the response is non-2xx, or the
  *          body is empty.
@@ -145,7 +144,7 @@ async function runHistoricalTextAgent(currentDate, nicheId, signal) {
   // arrest" for true_crime) BEFORE the AI filter agent ever sees the
   // results. The directive is the first line of the user message so
   // the model reads the search brief before anything else.
-  const queryContext = buildNicheQuery(nicheId, currentDate);
+  const queryContext = buildNicheQuery(nicheId);
   console.log(
     `[niche-query] active=${queryContext.id} window="${queryContext.dateWindow}" ` +
     `terms=${queryContext.searchTerms.length} categories=${queryContext.categoryFilters.length}`
@@ -397,7 +396,8 @@ async function generateImageSafely(apiKey, imagePrompt, slideIndex, styleSuffix,
 
 // ---------------------------------------------------------------------
 // Response helper — wraps a JS value in a Web Fetch API Response so the
-// handler works on both the Node.js and Edge Vercel runtimes.
+// handler works on both the Node.js Express runtime and any other
+// platform that mounts Web Fetch handlers (Workers, Deno, Bun, etc.).
 // ---------------------------------------------------------------------
 function jsonResponse(body, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(body), {
@@ -408,8 +408,9 @@ function jsonResponse(body, status = 200, extraHeaders = {}) {
 
 // ---------------------------------------------------------------------
 // Handler — exported as a NAMED export per HTTP method (Web Fetch API
-// signature). Vercel's auto-detector looks for `GET`, `POST`, etc. —
-// using `export default` would have been misread as the legacy
+// signature). server.js picks the `GET` / `POST` export per route and
+// converts Express req/res into a Web Request/Response round-trip.
+// Using `export default` would have been misread as the legacy
 // `(req, res) => void` Node.js signature and our return value would
 // have been ignored. Named export = unambiguous, future-proof.
 // ---------------------------------------------------------------------
@@ -417,7 +418,7 @@ function jsonResponse(body, status = 200, extraHeaders = {}) {
 // Last-resort safety net. If anything in the handler throws outside the
 // top-level try/catch (unhandled async rejection, sync throw from a
 // top-level constant initializer, etc.), catch it and try to send a
-// 500 instead of letting Vercel surface FUNCTION_INVOCATION_FAILED.
+// 500 instead of taking the Express process down.
 process.on('uncaughtException', (err) => {
   console.error('[uncaughtException]', err);
 });
@@ -425,7 +426,7 @@ process.on('unhandledRejection', (reason) => {
   console.error('[unhandledRejection]', reason);
 });
 
-export async function GET() {
+export const GET = withCors(async (_request, ctx) => {
   // Friendly response for direct browser hits (e.g., someone pasting
   // the URL into the address bar). The actual app flow is via POST
   // from public/app.js.
@@ -437,20 +438,25 @@ export async function GET() {
     405,
     { Allow: 'POST' }
   );
-}
+});
 
-export async function POST(request) {
-  // No method guard needed — Vercel only invokes the POST() export
-  // for POST requests. GET/PUT/etc. get a 405 from Vercel itself.
+export const POST = withCors(async (request, ctx) => {
+  // No method guard needed — server.js routes the POST() export
+  // only for POST requests. GET/PUT/etc. fall through to Express's
+  // built-in 405 handling.
   //
-  // `request` is the standard Web Request object (per the Vercel
-  // Functions API Reference). We don't read the body, but we do
-  // forward `request.signal` to the upstream fetch calls so a client
-  // disconnect cancels the in-flight MiniMax requests instead of
-  // leaving them to run to completion (and burn API credits).
+  // `request` is the standard Web Request object built by server.js
+  // from the Express req. We don't read the body here directly,
+  // but we do forward `request.signal` to the upstream fetch calls
+  // so a client disconnect cancels the in-flight MiniMax requests
+  // instead of leaving them to run to completion (and burn API credits).
 
   // --- Auth / config guard -----------------------------------------
   const apiKey = process.env.MINIMAX_API_KEY;
+  // Log the resolved end-user IP for ops/audit. Behind Cloudflare the
+  // raw `request` IP is a Cloudflare edge IP; `ctx.ip` is the real
+  // client (from CF-Connecting-IP / X-Forwarded-For).
+  if (ctx?.ip) console.log(`[ip] ${ctx.ip}`);
   if (!apiKey) {
     return jsonResponse({
       error: 'Server misconfigured: MINIMAX_API_KEY is not set.',
@@ -582,4 +588,4 @@ export async function POST(request) {
       details: err.message,
     }, 500);
   }
-}
+});

@@ -1,8 +1,8 @@
 // =====================================================================
 // InstaGen — Global niche store (vanilla, framework-agnostic)
 // =====================================================================
-// Why a hand-rolled store? This project is plain ES modules on Vercel
-// static — no React, no Redux, no Pinia. The "global state" the spec
+// Why a hand-rolled store? This project is plain ES modules served
+// as static assets — no React, no Redux, no Pinia. The "global state" the spec
 // asks for is just one key (`active_niche`) shared between two pages
 // (the hub at /, the generator at /generator). The contract below is
 // deliberately shaped like a small store API (get / set / subscribe)

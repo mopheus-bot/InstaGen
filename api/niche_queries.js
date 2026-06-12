@@ -2,10 +2,9 @@
 // InstaGen — Niche Query Builder (Data Access Layer)
 // =====================================================================
 // This module is the "conditional query builder" the spec calls for:
-// it converts the active niche id (and the current calendar date) into
-// a niche-specific query context that is injected into the upstream
-// text-LLM calls BEFORE the AI filter agent picks the top items of
-// the day.
+// it converts the active niche id into a niche-specific query context
+// that is injected into the upstream text-LLM calls BEFORE the AI
+// filter agent picks the top items of the day.
 //
 // What lives here is NOT persona/voice (that's api/niche_profiles.js)
 // and NOT a real external database. The LLM is still the data source
@@ -15,12 +14,10 @@
 // history on the right day.
 //
 // Resolution contract:
-//   buildNicheQuery(nicheId, currentDate)  →  always returns a context
-//                                            object (never null).
-//                                            Unknown / null / empty
-//                                            ids fall back to the
-//                                            'history' context — the
-//                                            original engine behavior.
+//   buildNicheQuery(nicheId)  →  always returns a context object
+//                               (never null). Unknown / null / empty
+//                               ids fall back to the 'history'
+//                               context — the original engine.
 //
 // Context shape:
 //   {
@@ -293,54 +290,33 @@ export const NICHE_QUERIES = {
 // ---------------------------------------------------------------------
 
 /**
- * Build a query context for the given niche id and calendar date.
- * Always returns a populated object — unknown / null / empty / non-
- * string ids all fall back to the 'history' context.
+ * Build a query context for the given niche id. Always returns a
+ * populated object — unknown / null / empty / non-string ids all
+ * fall back to the 'history' context.
  *
  * The factory reuses `resolveNicheProfile` to normalize the incoming
  * id (case-insensitive, alias-aware, snake_case ↔ kebab_case), so
  * every frontend id resolves to the right query context without
- * duplicating the alias table here.
+ * duplicating the alias table here. Return shape mirrors the shallow
+ * clone style of `resolveNicheProfile`.
  *
- * @param {*}       nicheId      The active_niche string from the
- *                               request body, or null/undefined.
- * @param {string}  currentDate  Human-readable date (e.g. "January 7").
- *                               Inlined into the directive so the LLM
- *                               sees the calendar context with the
- *                               query brief.
- * @returns {object}             Frozen context with { id, label,
- *                               searchTerms, categoryFilters,
- *                               dateWindow, directive,
- *                               structuredHint }.
+ * @param {*}       nicheId  The active_niche string from the request
+ *                           body, or null/undefined.
+ * @returns {object}         Context with { id, label, searchTerms,
+ *                           categoryFilters, dateWindow, directive,
+ *                           structuredHint }.
  */
-export function buildNicheQuery(nicheId, currentDate) {
-  // Defensive: any non-string input (null, undefined, number, object)
-  // skips the string lookups and falls straight to the default
-  // query context — same contract as resolveNicheProfile.
+export function buildNicheQuery(nicheId) {
   const profile = resolveNicheProfile(nicheId);
-  const id = profile.id;
+  const base = NICHE_QUERIES[profile.id] || NICHE_QUERIES[DEFAULT_QUERY_ID];
 
-  const base = NICHE_QUERIES[id] || NICHE_QUERIES[DEFAULT_QUERY_ID];
-
-  // Stamp the date into the directive so the LLM sees the calendar
-  // context inline with the query instructions. We build the final
-  // string here (not at module load) so it always reflects the
-  // current request's date — the LLM does NOT receive a stale
-  // "January 7" directive on a different day.
-  const dateStampedDirective = currentDate && typeof currentDate === 'string'
-    ? `${base.directive} (Target date: ${currentDate}.)`
-    : base.directive;
-
-  return Object.freeze({
-    id,
+  return {
+    id: profile.id,
     label: profile.label,
-    // Clone the arrays so a downstream consumer cannot mutate the
-    // shared registry. searchTerms / categoryFilters are read-only
-    // for the lifetime of the request.
-    searchTerms: [...base.searchTerms],
-    categoryFilters: [...base.categoryFilters],
+    searchTerms: base.searchTerms,
+    categoryFilters: base.categoryFilters,
     dateWindow: base.dateWindow,
-    directive: dateStampedDirective,
+    directive: base.directive,
     structuredHint: base.structuredHint || '',
-  });
+  };
 }

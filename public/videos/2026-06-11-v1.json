@@ -1,0 +1,31 @@
+{
+  "id": "2026-06-11-v1",
+  "note": "No video bundler configured. Set EXTERNAL_VIDEO_WEBHOOK for production or BUNDLE_PROVIDER=ffmpeg (plus `npm i ffmpeg-static fluent-ffmpeg`) for local dev.",
+  "title": "t1",
+  "year": "1925",
+  "hook": "",
+  "script": "",
+  "duration_seconds": 15,
+  "scenes": [
+    {
+      "index": 0,
+      "start_seconds": 0,
+      "imageUrl": "data:image/jpeg;base64,aGVsbG8="
+    },
+    {
+      "index": 1,
+      "start_seconds": 3.75,
+      "imageUrl": "data:image/jpeg;base64,aGVsbG8="
+    },
+    {
+      "index": 2,
+      "start_seconds": 7.5,
+      "imageUrl": "data:image/jpeg;base64,aGVsbG8="
+    },
+    {
+      "index": 3,
+      "start_seconds": 11.25,
+      "imageUrl": "data:image/jpeg;base64,aGVsbG8="
+    }
+  ]
+}

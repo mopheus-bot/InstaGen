@@ -6,13 +6,19 @@ Internal tool that generates a daily 8-slide carousel (historical or one of six 
 
 ```
 instagen/
-├── package.json          # Express + cors + dotenv + serverless-http, ESM
-├── .env                  # PORT, MINIMAX_API_KEY, MINIMAX_API_BASE
+├── package.json          # Express + cors + dotenv + express-rate-limit, ESM
+├── .env                  # PORT, MINIMAX_API_KEY, PUBLIC_URL, ALLOWED_ORIGINS
 ├── .gitignore
-├── vercel.json           # Vercel routing (rewrites + function timeouts)
+├── server.js             # Express bootstrap — trust proxy, CORS, rate limit
 ├── api/
+│   ├── _request.js               # Cloudflare-aware CORS + client-IP helpers
 │   ├── generate-content.js       # POST /api/generate-content  (niche-aware)
-│   └── generate-daily-videos.js  # POST /api/generate-daily-videos
+│   ├── generate-daily-videos.js  # POST /api/generate-daily-videos
+│   ├── video-callback.js         # POST /api/video-callback  (MiniMax webhook)
+│   ├── video-status.js           # GET  /api/video-status
+│   ├── video_task_store.js       # In-process task state
+│   ├── niche_profiles.js         # Per-niche persona + image style factory
+│   └── niche_queries.js          # Per-niche search directives
 └── public/
     ├── index.html        # Theme Hub landing page (niche picker)
     ├── hub.js            # Hub controller (renders cards, handles click → store → route)
@@ -23,6 +29,8 @@ instagen/
         └── placeholder-error.png
 ```
 
+`server.js` is the entrypoint. It mounts every `api/*.js` handler under `/api/*` by converting each Express `req`/`res` into a Web `Request`/`Response` round-trip, so the handlers stay single-source. `api/_request.js` provides Cloudflare-aware client-IP resolution and a dynamic CORS policy driven by `PUBLIC_URL` and `ALLOWED_ORIGINS`.
+
 ## Pages
 
 | Route       | File               | Purpose                                                |
@@ -30,7 +38,7 @@ instagen/
 | `/`         | `index.html`       | Theme Hub: 7 niche cards, click → save & navigate      |
 | `/generator`| `generator.html`   | The original dashboard, now niche-aware with a badge   |
 
-The hub is the entry point. The dashboard is reached by picking a niche on the hub. A `vercel.json` rewrite maps `/generator` → `/generator.html` for a clean URL.
+The hub is the entry point. The dashboard is reached by picking a niche on the hub. `server.js` serves `/generator` and `/` as clean URLs (the static layer maps `/generator` → `generator.html`).
 
 ## Niches
 
@@ -71,18 +79,17 @@ npm run dev              # http://localhost:3000
 
 ## Deployment
 
-### Vercel
-Push to a Git repo and import in Vercel. The included `vercel.json`:
-- rewrites `/generator` → `/generator.html`
-- pins `/api/*` timeouts (60s for content, 300s for video)
-- forwards `request.signal` to upstream fetches (set `supportsCancellation: true`)
+### Railway (or any long-lived Node host)
 
-Set `MINIMAX_API_KEY` in **Project Settings → Environment Variables**.
-
-### Render
 - **Build command:** `npm install`
 - **Start command:** `npm start`
-- **Environment:** add `MINIMAX_API_KEY` (and optionally `PORT`)
+- **Environment:** add `MINIMAX_API_KEY`, `PUBLIC_URL`, and (optionally) `ALLOWED_ORIGINS`, `INTERNAL_KEY`
+
+`server.js` binds to `process.env.PORT` (default 3000). The `app.set('trust proxy', true)` line is what makes `req.ip` resolve to the real end-user IP behind Cloudflare; do not remove it. The in-app rate limit (200 req / 15 min globally, 10 req / 15 min on generation endpoints) is the second line of defense; the first is the Cloudflare WAF rate-limit rule on `/api/*` (see `CLOUDFLARE_PROXY_SETUP.md`).
+
+### Behind Cloudflare
+
+Set the DNS records for `instagen.app` (and any subdomain) to orange-cloud the deployment host. See `CLOUDFLARE_PROXY_SETUP.md` for the full dashboard checklist (TLS mode, WAF rule, transform rules, etc.).
 
 ## API
 
@@ -115,12 +122,23 @@ Resolves today's date server-side, generates 8 niche-scoped events via `MiniMax-
 
 Same body shape (`{ niche }`). Five-step pipeline → `{ videos: [{url, title, year}] }`.
 
+### `GET /api/video-status?ids=t1,t2,t3`
+
+Polled by the frontend after submitting async text-to-video tasks. Returns `{ tasks: { t1: { status, url, fileId, error } } }`.
+
+### `POST /api/video-callback`
+
+Server-to-server webhook target for MiniMax's async video pipeline. Accepts the challenge handshake and status updates. See `api/video-callback.js` for the payload shape.
+
 ### `GET /api/health`
 
 Liveness probe — returns `{ status, time, apiKeyConfigured }`.
 
 ## Safeguards
 
+- **Trust proxy** — `app.set('trust proxy', true)` makes `req.ip` resolve to the real end-user IP (via `CF-Connecting-IP` / `X-Forwarded-For`).
+- **Dynamic CORS** — `api/_request.js` resolves the allowlist from `PUBLIC_URL` + `ALLOWED_ORIGINS` on every request, with `Vary: Origin` and never a wildcard.
+- **Two-tier rate limit** — global 200 req / 15 min, generation endpoints 10 req / 15 min, keyed on the real client IP, with an `INTERNAL_KEY` bypass for smoke tests.
 - **JSON parsing** — tries `JSON.parse`, then strips ```json fences, then regex-extracts the slice between the first `[` and last `]`.
 - **Per-image fault isolation** — failed slices fall back to an inline-SVG placeholder, the rest of the carousel still ships.
 - **Niche-scoped localStorage cache** — payloads are keyed by `instagen:daily:v2:<niche>:<YYYY-MM-DD>`, so switching niches on the hub never shows another niche's stale carousel.

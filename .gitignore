@@ -27,7 +27,6 @@ Thumbs.db
 dist/
 build/
 .cache/
-.vercel/
 
 # Local scratch
 *.txt.bak
